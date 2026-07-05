@@ -213,3 +213,31 @@ Guía paso a paso para Fede (no técnico-denso): 1) crear proyecto Supabase, 2) 
 **Compras:** agrega ingredientes de todos los combos planificados de la semana visible → lista `nombre — cantidad total unidad`, con checkbox (estado local/localStorage, no DB) y botón "Copiar lista" (clipboard) para mandarla por WhatsApp.
 
 Estados vacíos con guía ("Todavía no planificaste esta semana → andá a Semana"). Todo responsive mobile-first. Loading states simples. Errores de Supabase → `toast(msg, 'error')`, nunca romper el render.
+
+## 8b. Plantillas de día (extensión Fase 1 — owner SQL: sql/03_dias_tipo.sql · owner NUTRICION: js/modules/nutricion.js)
+
+**Concepto:** el usuario come por patrones de día ("día tipo", "sin merienda", etc.). Una plantilla define qué va en cada slot. Planificar la semana = aplicar plantillas a días. Aplicar NO bloquea nada: el día queda como filas normales de `nutricion_plan`, editables individualmente después (flexibilidad total, para cualquier usuario).
+
+### SQL (03_dias_tipo.sql — idempotente, correr después de 01)
+```sql
+nutricion_dias_tipo (
+  id uuid PK default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  nombre text not null,
+  items jsonb not null default '[]'::jsonb,   -- [{"slot":"almuerzo","tipo":"combo"|"alimento","item_id":"<uuid>"}]
+  notas text,
+  _deleted boolean default false,
+  created_at timestamptz default now()
+)
+```
++ RLS 4 políticas explícitas (mismo patrón que las demás).
++ `alter table nutricion_plan add column if not exists alimento_id uuid references nutricion_alimentos(id);`
+  (una celda del plan tiene combo_id **o** alimento_id, nunca ambos — sin constraint, lo garantiza la app al escribir).
++ Seed guarded para el primer usuario: 1 plantilla "Día tipo" = almuerzo → alimento 'Carne roja magra' porción '250 g' · merienda → combo 'Batido' · cena → combo 'Tostado' (ids resueltos por subselect por nombre; si falta alguno, `raise notice` y skip — no exception).
+
+### Módulo (comportamiento)
+- **Semana**: cada card de día suma acción "Plantilla" → modal con: lista de plantillas (tap = aplicar al día), borrar plantilla (confirmDialog), y si el día ya tiene celdas asignadas, "Guardar este día como plantilla" (input nombre). Aplicar = por cada item: update de la fila (fecha,slot) si existe, insert si no; setea combo_id XOR alimento_id (nullea el otro). Slots que la plantilla no cubre quedan intactos.
+- **Celda del plan** (modal existente de asignar): tabs **Combos | Alimentos** — ahora se puede planificar un alimento/ancla suelto (ej. "Carne roja magra 250 g" de almuerzo). La celda muestra nombre (+porción si es alimento).
+- **Prep y Compras**: los alimentos planificados entran a la agregación como ingrediente `{nombre, cantidad: veces, unidad: '× ' + porcion}` → se ve "Carne roja magra: 3 × 250 g". Combos igual que hoy.
+- **Hoy**: si un slot está vacío y hay plan para hoy en ese slot → chip "Planificado: <nombre>" con botón anotar de 1 tap (snapshot de macros actuales del combo/alimento). Cierra el loop plan→log sin fricción.
+- `S.diasTipo` se carga en init junto al catálogo y se refresca con el refetch silencioso. Cero hardcodeo de slots/valores (todo sigue saliendo de config y tablas). Data-actions nuevos por el onClick delegado existente. Clases prefijo `nut-`.

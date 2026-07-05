@@ -184,6 +184,7 @@ Cada fase es un milestone ejecutable con su propio prompt para Claude Code. **No
 
 1. **Log diario** — 3 slots (Almuerzo/Merienda/Cena) que matchean el ayuno. Tap sobre ancla o combo favorito → suma al total del día. Barra de progreso hacia el target. Sistema de favoritos.
 2. **Planificador semanal** — asignar combos/comidas a cada slot de cada día. Vista de la semana.
+   2b. **Plantillas de día** — el usuario come por patrones ("día tipo", "sin merienda"…): plantillas que llenan los slots de un día de 1 tap. La semana se planifica aplicando plantillas por día; cada día queda editable individualmente después (spec técnica en docs/CONTRATOS.md §8b).
 3. **Meal prep** — a partir del plan semanal, agrupa qué cocinar en batch.
 4. **Lista de compras** — deriva automáticamente del plan semanal: qué ingredientes y cuánto comprar.
 5. Persistencia Supabase, RLS por `user_id`. UI dark + turquesa.

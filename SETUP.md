@@ -20,7 +20,7 @@ En el panel de Supabase, menú izquierdo → **SQL Editor** → **New query**.
 - [ ] Abrí `sql/00_core.sql` de esta carpeta, copiá TODO el contenido, pegalo y tocá **Run**. Tiene que decir "Success".
 - [ ] Repetí con `sql/01_nutricion.sql`. "Success" de nuevo.
 
-Los tres archivos SQL son idempotentes: si corriste uno dos veces por error, no pasa nada.
+Los archivos SQL son idempotentes: si corriste uno dos veces por error, no pasa nada.
 
 **Todavía NO corras `02_seed_nutricion.sql`** — primero va el paso 3.
 
@@ -30,10 +30,11 @@ Los tres archivos SQL son idempotentes: si corriste uno dos veces por error, no 
 - [ ] Email: `federicomengelle@gmail.com` · Password: elegí una fuerte y guardala. Dejá tildado **Auto Confirm User** si aparece la opción.
 - [ ] Ahora cerrá la puerta: **Authentication** → **Sign In / Providers** (según versión del panel puede decir "Providers" o "Settings") → en **Email**, desactivá **"Allow new users to sign up"** y guardá. Así nadie más puede crearse cuenta: sos el único usuario.
 
-## 4. Correr el seed (02)
+## 4. Correr los seeds (02 y 03)
 
 - [ ] Volvé al **SQL Editor**, pegá TODO `sql/02_seed_nutricion.sql` y **Run**.
 - [ ] Tiene que terminar en "Success". Si te tira el error *"No hay usuarios en auth.users..."* es que te salteaste el paso 3: creá el usuario y corré el seed de nuevo.
+- [ ] Después pegá y corré `sql/03_dias_tipo.sql` — crea las plantillas de día (necesita el 02 ya corrido).
 
 Esto carga: tu config de nutrición (target de proteína, ayuno, slots, compensación, creatina), las 16 anclas de proteína con sus macros, el queso proteico provisorio y los 4 combos (Batido, Tostada, Tostado, Rapiditas) con sus ingredientes.
 
@@ -100,4 +101,16 @@ Quedaron tres datos provisorios que conviene confirmar y corregir desde la app (
 - **Login rechazado**: revisá que el usuario esté "Confirmed" en Authentication → Users, y que `env.js` tenga la URL/key correctas (sin espacios ni comillas de más).
 - **Error "Invalid path specified in request URL"**: la `SUPABASE_URL` de `env.js` tiene un path de más (ej. copiaste `.../rest/v1/`). Tiene que ser SOLO la base: `https://TUPROYECTO.supabase.co` — sin nada después del `.co`.
 - **La app carga pero no muestra datos**: casi seguro corriste el seed antes de crear el usuario, o creaste un segundo usuario antes que el tuyo (el seed toma el PRIMER usuario creado). Verificá en Table Editor que las filas de `nutricion_alimentos` tengan tu `user_id`.
-- **Error al correr un SQL**: corrélos en orden (00 → 01 → 02). Se pueden re-correr sin miedo, son idempotentes.
+- **Error al correr un SQL**: corrélos en orden (00 → 01 → 02 → 03). Se pueden re-correr sin miedo, son idempotentes.
+
+---
+
+## Actualización — Plantillas de día (`sql/03_dias_tipo.sql`)
+
+¿Ya tenés la app andando de antes? Solo hay que correr un SQL más:
+
+- [ ] **SQL Editor** → pegá TODO `sql/03_dias_tipo.sql` → **Run**. "Success" y listo.
+
+Crea la tabla de plantillas de día, le agrega la columna `alimento_id` al plan semanal y te deja armada la plantilla "Día tipo" (almuerzo: carne roja magra 250 g · merienda: Batido · cena: Tostado). Idempotente como los demás.
+
+Si estás instalando de cero: corré el 03 después del seed (02), así la plantilla encuentra sus alimentos y combos.

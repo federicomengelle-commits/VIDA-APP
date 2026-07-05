@@ -60,12 +60,16 @@ const S = {
   semana: lunesDe(hoyStr()), // lunes de la semana visible (Semana/Prep/Compras)
   alimentos: [],
   combos: [],
+  diasTipo: [],            // plantillas de día (nutricion_dias_tipo)
   log: [],                 // nutricion_log del día visible
   plan: [],                // nutricion_plan de la semana visible
   cargando: false,
+  mutandoPlan: false,      // in-flight guard de mutaciones del plan (doble tap)
+  anotando: false,         // in-flight guard de inserts al log (doble tap)
   picker: null,            // { slot, tab: 'favoritos'|'combos'|'alimentos'|'manual' }
   busca: '',
-  comboPicker: null,       // { fecha, slot } → modal del planificador
+  comboPicker: null,       // { fecha, slot, tab: 'combos'|'alimentos' } → modal del planificador
+  plantillaModal: null,    // { fecha } → modal de plantillas de día
   ultimaCarga: 0,
 };
 
@@ -88,16 +92,26 @@ function cfgCreatina() { return S.config ? S.config.get('creatina', null) : null
    Datos — Supabase (siempre .eq('user_id') + soft delete donde exista)
    ============================================================ */
 async function cargarCatalogo() {
-  const [alim, comb] = await Promise.all([
+  const [alim, comb, dias] = await Promise.all([
     supabase.from('nutricion_alimentos').select('*')
       .eq('user_id', S.userId).eq('_deleted', false).order('nombre'),
     supabase.from('nutricion_combos').select('*')
+      .eq('user_id', S.userId).eq('_deleted', false).order('nombre'),
+    supabase.from('nutricion_dias_tipo').select('*')
       .eq('user_id', S.userId).eq('_deleted', false).order('nombre'),
   ]);
   if (alim.error) throw alim.error;
   if (comb.error) throw comb.error;
   S.alimentos = alim.data || [];
   S.combos = comb.data || [];
+  // Plantillas degradan con gracia: si la tabla no está (falta correr sql/03)
+  // la feature queda apagada pero el catálogo existente NO se rompe.
+  if (dias.error) {
+    S.diasTipo = [];
+    console.warn('[nutricion] nutricion_dias_tipo no disponible (¿falta correr sql/03?):', dias.error);
+  } else {
+    S.diasTipo = dias.data || [];
+  }
 }
 
 // Devuelven false si la respuesta llegó tarde (el usuario ya navegó a otro
@@ -156,8 +170,10 @@ function combosOrdenados(slotId) {
 // ingredientes por nombre+unidad (base de Prep y Compras).
 function resumenSemana() {
   const conteo = new Map();
+  const conteoAlim = new Map();
   for (const p of S.plan) {
     if (p.combo_id) conteo.set(p.combo_id, (conteo.get(p.combo_id) || 0) + 1);
+    else if (p.alimento_id) conteoAlim.set(p.alimento_id, (conteoAlim.get(p.alimento_id) || 0) + 1);
   }
   const combos = [];
   const ing = new Map();
@@ -176,9 +192,56 @@ function resumenSemana() {
       ing.set(key, prev);
     }
   }
+  // Alimentos sueltos planificados → entran como "N × porción" (ej: 3 × 250 g)
+  for (const [id, veces] of conteoAlim) {
+    const a = S.alimentos.find(x => x.id === id);
+    if (!a) continue;
+    const nombre = String(a.nombre).trim();
+    const unidad = a.porcion ? '× ' + String(a.porcion).trim() : 'veces';
+    const key = (nombre + '|' + unidad).toLowerCase();
+    const prev = ing.get(key) || { nombre, unidad, cantidad: 0 };
+    prev.cantidad += veces;
+    ing.set(key, prev);
+  }
   combos.sort((a, b) => (b.veces - a.veces) || String(a.combo.nombre).localeCompare(String(b.combo.nombre)));
   const ingredientes = [...ing.values()].sort((a, b) => a.nombre.localeCompare(b.nombre));
   return { combos, ingredientes };
+}
+
+// Items (combo_id XOR alimento_id) asignados a los slots de un día → formato
+// jsonb de nutricion_dias_tipo: [{ slot, tipo, item_id }]
+function itemsDelDia(fecha) {
+  const items = [];
+  for (const sl of cfgSlots()) {
+    const p = planDe(fecha, sl.id);
+    if (!p) continue;
+    if (p.combo_id) items.push({ slot: sl.id, tipo: 'combo', item_id: p.combo_id });
+    else if (p.alimento_id) items.push({ slot: sl.id, tipo: 'alimento', item_id: p.alimento_id });
+  }
+  return items;
+}
+
+// Lo planificado para (fecha, slot) resuelto contra el catálogo actual
+// (snapshot de macros de HOY, no del momento de planificar). Null si el plan
+// cargado es de otra semana o el item ya no existe.
+function itemPlanificado(fecha, slotId) {
+  if (lunesDe(fecha) !== S.semana) return null;
+  const p = planDe(fecha, slotId);
+  if (!p) return null;
+  if (p.combo_id) {
+    const c = S.combos.find(x => x.id === p.combo_id);
+    return c ? { tipo: 'combo', id: c.id, nombre: c.nombre, prot: c.prot, carbo: c.carbo, grasa: c.grasa, kcal: c.kcal } : null;
+  }
+  if (p.alimento_id) {
+    const a = S.alimentos.find(x => x.id === p.alimento_id);
+    if (!a) return null;
+    return {
+      tipo: 'alimento', id: a.id,
+      nombre: a.porcion ? a.nombre + ' (' + a.porcion + ')' : a.nombre,
+      prot: a.prot, carbo: a.carbo, grasa: a.grasa, kcal: a.kcal,
+    };
+  }
+  return null;
 }
 
 /* ============================================================
@@ -206,6 +269,9 @@ function textoConteoCompras() {
    Mutaciones
    ============================================================ */
 async function agregarEntrada(slot, item) {
+  if (S.anotando) return; // doble tap: una anotación a la vez
+  S.anotando = true;
+  const fecha = S.fecha;
   try {
     const fila = {
       user_id: S.userId,
@@ -221,12 +287,13 @@ async function agregarEntrada(slot, item) {
     };
     const { data, error } = await supabase.from('nutricion_log').insert(fila).select().single();
     if (error) throw error;
-    S.log.push(data);
+    if (S.fecha === fecha) S.log.push(data); // si navegó de día mientras insertaba, no contaminar la vista
     toast('Anotado: ' + item.nombre, 'success');
     paint();
   } catch (err) {
     toast('No se pudo anotar: ' + msgErr(err), 'error');
   }
+  S.anotando = false;
 }
 
 function addAlimento(id) {
@@ -289,38 +356,133 @@ async function toggleFav(tipo, id) {
   }
 }
 
-async function asignarCombo(comboId) {
+// Upsert de una celda del plan: update de la fila (fecha,slot) si existe,
+// insert si no. patch setea combo_id XOR alimento_id (nullea el otro).
+// `previo` opcional: fila snapshot para no depender de S.plan (que puede
+// haber cambiado si el usuario navegó de semana durante un loop de awaits).
+async function upsertPlan(fecha, slot, patch, previo = undefined) {
+  const fila = previo === undefined ? planDe(fecha, slot) : previo;
+  if (fila) {
+    const { data, error } = await supabase.from('nutricion_plan')
+      .update(patch)
+      .eq('id', fila.id).eq('user_id', S.userId)
+      .select().single();
+    if (error) throw error;
+    Object.assign(fila, data);
+  } else {
+    const { data, error } = await supabase.from('nutricion_plan')
+      .insert({ user_id: S.userId, fecha, slot, ...patch })
+      .select().single();
+    if (error) throw error;
+    if (lunesDe(fecha) === S.semana) S.plan.push(data); // no contaminar el estado de otra semana
+  }
+}
+
+async function asignarPlanItem(patch) {
+  if (S.mutandoPlan) return; // doble tap
   const ctx = S.comboPicker;
   if (!ctx) return;
+  S.mutandoPlan = true;
   try {
-    const previo = planDe(ctx.fecha, ctx.slot);
-    if (previo) {
-      const { data, error } = await supabase.from('nutricion_plan')
-        .update({ combo_id: comboId })
-        .eq('id', previo.id).eq('user_id', S.userId)
-        .select().single();
-      if (error) throw error;
-      Object.assign(previo, data);
-    } else {
-      const { data, error } = await supabase.from('nutricion_plan')
-        .insert({ user_id: S.userId, fecha: ctx.fecha, slot: ctx.slot, combo_id: comboId })
-        .select().single();
-      if (error) throw error;
-      S.plan.push(data);
-    }
+    await upsertPlan(ctx.fecha, ctx.slot, patch);
     S.comboPicker = null;
     toast('Plan actualizado', 'success');
   } catch (err) {
     toast('No se pudo asignar: ' + msgErr(err), 'error');
   }
+  S.mutandoPlan = false;
   paint();
 }
 
+function asignarCombo(comboId) { return asignarPlanItem({ combo_id: comboId, alimento_id: null }); }
+function asignarAlimento(alimentoId) { return asignarPlanItem({ alimento_id: alimentoId, combo_id: null }); }
+
+async function aplicarPlantilla(id) {
+  const ctx = S.plantillaModal;
+  if (!ctx) return;
+  const pl = S.diasTipo.find(x => x.id === id);
+  if (!pl) return;
+  const items = (Array.isArray(pl.items) ? pl.items : [])
+    .filter(i => i && i.slot && i.item_id && (i.tipo === 'combo' || i.tipo === 'alimento'));
+  if (!items.length) { toast('La plantilla no tiene items', 'warning'); return; }
+  if (S.mutandoPlan) return; // doble tap: una aplicación a la vez
+  S.mutandoPlan = true;
+  // Snapshot de las filas existentes del día ANTES de los awaits: si el
+  // usuario navega de semana a mitad del loop, planDe dejaría de verlas y
+  // se insertarían filas duplicadas.
+  const previos = new Map(items.map(it => [it.slot, planDe(ctx.fecha, it.slot)]));
+  S.plantillaModal = null; // cerrar ya: sin re-taps posibles sobre el modal
+  paint();
+  try {
+    for (const it of items) {
+      const patch = it.tipo === 'combo'
+        ? { combo_id: it.item_id, alimento_id: null }
+        : { alimento_id: it.item_id, combo_id: null };
+      await upsertPlan(ctx.fecha, it.slot, patch, previos.get(it.slot) || null);
+    }
+    toast('Plantilla aplicada: ' + pl.nombre, 'success');
+  } catch (err) {
+    toast('No se pudo aplicar la plantilla: ' + msgErr(err), 'error');
+  }
+  S.mutandoPlan = false;
+  paint();
+}
+
+async function borrarPlantilla(id) {
+  const pl = S.diasTipo.find(x => x.id === id);
+  if (!pl) return;
+  const ok = await confirmDialog({
+    title: 'Borrar plantilla',
+    message: '¿Borrás la plantilla "' + pl.nombre + '"? Los días ya planificados quedan como están.',
+    confirmText: 'Borrar',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const { error } = await supabase.from('nutricion_dias_tipo')
+      .update({ _deleted: true })
+      .eq('id', id).eq('user_id', S.userId);
+    if (error) throw error;
+    S.diasTipo = S.diasTipo.filter(x => x.id !== id);
+    toast('Plantilla borrada', 'success');
+    paint();
+  } catch (err) {
+    toast('No se pudo borrar la plantilla: ' + msgErr(err), 'error');
+  }
+}
+
+async function guardarPlantilla(nombre) {
+  const ctx = S.plantillaModal;
+  if (!ctx) return;
+  const items = itemsDelDia(ctx.fecha);
+  if (!items.length) { toast('El día no tiene nada asignado para guardar', 'warning'); return; }
+  try {
+    const { data, error } = await supabase.from('nutricion_dias_tipo')
+      .insert({ user_id: S.userId, nombre, items })
+      .select().single();
+    if (error) throw error;
+    S.diasTipo.push(data);
+    S.diasTipo.sort((a, b) => String(a.nombre).localeCompare(String(b.nombre)));
+    toast('Plantilla guardada: ' + nombre, 'success');
+    paint();
+  } catch (err) {
+    toast('No se pudo guardar la plantilla: ' + msgErr(err), 'error');
+  }
+}
+
+function anotarPlanificado(slotId) {
+  const item = itemPlanificado(S.fecha, slotId);
+  if (!item) return;
+  return agregarEntrada(slotId, item);
+}
+
 async function quitarPlan() {
+  if (S.mutandoPlan) return; // doble tap
   const ctx = S.comboPicker;
   if (!ctx) return;
   const previo = planDe(ctx.fecha, ctx.slot);
   if (!previo) { S.comboPicker = null; paint(); return; }
+  S.mutandoPlan = true;
   try {
     const { error } = await supabase.from('nutricion_plan').delete()
       .eq('id', previo.id).eq('user_id', S.userId);
@@ -330,6 +492,7 @@ async function quitarPlan() {
   } catch (err) {
     toast('No se pudo quitar: ' + msgErr(err), 'error');
   }
+  S.mutandoPlan = false;
   S.comboPicker = null;
   paint();
 }
@@ -338,9 +501,14 @@ async function cambiarDia(fecha) {
   S.fecha = fecha;
   S.picker = null;
   S.cargando = true;
+  // El chip "Planificado" resuelve contra la semana del día visible: si el
+  // día cruza de semana, la semana cargada se reengancha a la del día.
+  const cruzaSemana = lunesDe(fecha) !== S.semana;
+  if (cruzaSemana) S.semana = lunesDe(fecha);
   paint();
   try {
-    if (!(await cargarLog())) return; // llegó tarde: otra navegación se hizo cargo
+    const [logOk] = await Promise.all([cargarLog(), cruzaSemana ? cargarPlan() : Promise.resolve(true)]);
+    if (!logOk) return; // llegó tarde: otra navegación se hizo cargo
   } catch (err) {
     if (S.fecha !== fecha) return;
     S.log = []; // nunca dejar comidas de otro día bajo este label
@@ -353,6 +521,7 @@ async function cambiarDia(fecha) {
 async function cambiarSemana(lunes) {
   S.semana = lunes;
   S.comboPicker = null;
+  S.plantillaModal = null;
   S.cargando = true;
   paint();
   try {
@@ -419,7 +588,8 @@ function bind() {
 function onEscape(e) {
   if (e.key !== 'Escape') return;
   if (!S.container || !S.container.isConnected) return;
-  if (S.comboPicker) { S.comboPicker = null; paint(); }
+  if (S.plantillaModal) { S.plantillaModal = null; paint(); }
+  else if (S.comboPicker) { S.comboPicker = null; paint(); }
   else if (S.picker) { S.picker = null; paint(); }
 }
 
@@ -428,7 +598,16 @@ function onClick(e) {
   if (!el || !el.closest('.nut')) return;
   const a = el.dataset.action;
 
-  if (a === 'tab') { S.tab = el.dataset.tab; S.picker = null; S.comboPicker = null; paint(); return; }
+  if (a === 'tab') {
+    S.tab = el.dataset.tab; S.picker = null; S.comboPicker = null; S.plantillaModal = null;
+    // Al volver a Hoy después de navegar semanas: reenganchar el plan a la
+    // semana del día visible para que el chip "Planificado" resuelva bien.
+    if (S.tab === 'hoy' && lunesDe(S.fecha) !== S.semana) {
+      S.semana = lunesDe(S.fecha);
+      cargarPlan().then(ok => { if (ok) paint(); }).catch(() => {});
+    }
+    paint(); return;
+  }
 
   if (a === 'dia-prev') { cambiarDia(addDias(S.fecha, -1)); return; }
   if (a === 'dia-next') { cambiarDia(addDias(S.fecha, 1)); return; }
@@ -447,19 +626,40 @@ function onClick(e) {
   if (a === 'sem-next') { cambiarSemana(addDias(S.semana, 7)); return; }
   if (a === 'sem-hoy') { cambiarSemana(lunesDe(hoyStr())); return; }
 
-  if (a === 'celda') { S.comboPicker = { fecha: el.dataset.fecha, slot: el.dataset.slot }; paint(); return; }
+  if (a === 'celda') {
+    const p = planDe(el.dataset.fecha, el.dataset.slot);
+    S.comboPicker = { fecha: el.dataset.fecha, slot: el.dataset.slot, tab: p && p.alimento_id ? 'alimentos' : 'combos' };
+    paint(); return;
+  }
   if (a === 'modal-cerrar') { S.comboPicker = null; paint(); return; }
   if (a === 'modal-fondo') { if (e.target === el) { S.comboPicker = null; paint(); } return; }
+  if (a === 'plan-tab') { if (S.comboPicker) { S.comboPicker.tab = el.dataset.ptab; paint(); } return; }
   if (a === 'plan-asignar') { asignarCombo(el.dataset.id); return; }
+  if (a === 'plan-asignar-alimento') { asignarAlimento(el.dataset.id); return; }
   if (a === 'plan-quitar') { quitarPlan(); return; }
+  if (a === 'anotar-plan') { anotarPlanificado(el.dataset.slot); return; }
+
+  if (a === 'abrir-plantillas') { S.plantillaModal = { fecha: el.dataset.fecha }; paint(); return; }
+  if (a === 'plantilla-cerrar') { S.plantillaModal = null; paint(); return; }
+  if (a === 'plantilla-fondo') { if (e.target === el) { S.plantillaModal = null; paint(); } return; }
+  if (a === 'plantilla-aplicar') { aplicarPlantilla(el.dataset.id); return; }
+  if (a === 'plantilla-borrar') { borrarPlantilla(el.dataset.id); return; }
 
   if (a === 'copiar') { copiarLista(); return; }
   if (a === 'ir-semana') { S.tab = 'semana'; paint(); return; }
 }
 
 function onSubmit(e) {
-  const form = e.target.closest('form[data-action="manual"]');
+  const form = e.target.closest('form[data-action]');
   if (!form || !form.closest('.nut')) return;
+  if (form.dataset.action === 'guardar-plantilla') {
+    e.preventDefault();
+    const nombre = String(new FormData(form).get('nombre') || '').trim();
+    if (!nombre) { toast('Poné un nombre para la plantilla', 'warning'); return; }
+    guardarPlantilla(nombre);
+    return;
+  }
+  if (form.dataset.action !== 'manual') return;
   e.preventDefault();
   if (!S.picker) return;
   const fd = new FormData(form);
@@ -525,6 +725,7 @@ function paint() {
     </header>
     <div class="nut-cuerpo">${vista}</div>
     ${S.comboPicker ? modalCombos() : ''}
+    ${S.plantillaModal ? modalPlantillas() : ''}
   </div>`;
 }
 
@@ -548,7 +749,7 @@ function vacioPlan() {
   <div class="nut-vacio">
     <div class="nut-vacio-icono">🗓️</div>
     <p>Todavía no planificaste esta semana.</p>
-    <p class="nut-vacio-sub">Asigná combos a los días y de ahí salen el prep y las compras solos.</p>
+    <p class="nut-vacio-sub">Asigná combos o alimentos a los días (o aplicá una plantilla de día) y de ahí salen el prep y las compras solos.</p>
     <button class="nut-btn-primario" data-action="ir-semana">Andá a Semana</button>
   </div>`;
 }
@@ -618,10 +819,21 @@ function hintCompensacion(slot, entradas) {
   return `<div class="nut-hint">⚠️ ${esc(comp.regla)}</div>`;
 }
 
+function chipPlanificado(slot) {
+  const item = itemPlanificado(S.fecha, slot.id);
+  if (!item) return '';
+  return `
+  <div class="nut-plan-chip">
+    <span class="nut-plan-chip-txt">📌 Planificado: <strong>${esc(item.nombre)}</strong></span>
+    <button class="nut-plan-chip-btn" data-action="anotar-plan" data-slot="${esc(slot.id)}">Anotar</button>
+  </div>`;
+}
+
 function seccionSlot(slot) {
   const entradas = entradasSlot(slot.id);
   const totProt = entradas.reduce((s, e) => s + (Number(e.prot) || 0), 0);
   const abierto = S.picker && S.picker.slot === slot.id;
+  const chip = entradas.length ? '' : chipPlanificado(slot);
   return `
   <section class="nut-slot nut-card">
     <header class="nut-slot-head">
@@ -632,7 +844,7 @@ function seccionSlot(slot) {
       ${entradas.length ? `<div class="nut-slot-prot"><span class="nut-num">${num(totProt)}</span> g prot</div>` : ''}
     </header>
     ${hintCompensacion(slot, entradas)}
-    ${entradas.length ? entradas.map(filaEntrada).join('') : `<div class="nut-slot-vacio">Nada anotado todavía</div>`}
+    ${entradas.length ? entradas.map(filaEntrada).join('') : (chip || `<div class="nut-slot-vacio">Nada anotado todavía</div>`)}
     ${abierto ? pickerHTML(slot) : `<button class="nut-agregar" data-action="abrir-picker" data-slot="${esc(slot.id)}">+ Agregar comida</button>`}
   </section>`;
 }
@@ -760,7 +972,7 @@ function vistaSemana() {
   const nav = navSemana();
   if (S.cargando) return nav + `<div class="nut-cargando">Cargando la semana…</div>`;
   if (!slots.length) return nav + vacioConfig();
-  const aviso = S.combos.length ? '' : `<div class="nut-hint">No hay combos cargados: corré el seed (sql/02_seed_nutricion.sql) para poder planificar.</div>`;
+  const aviso = (S.combos.length || S.alimentos.length) ? '' : `<div class="nut-hint">No hay combos ni alimentos cargados: corré el seed (sql/02_seed_nutricion.sql) para poder planificar.</div>`;
   const fechas = Array.from({ length: 7 }, (_, i) => addDias(S.semana, i));
   return nav + aviso + `<div class="nut-sem-grid">${fechas.map(f => diaCard(f, slots)).join('')}</div>`;
 }
@@ -772,21 +984,25 @@ function diaCard(fecha, slots) {
     <div class="nut-sem-dia-head">${DIAS[diaIdx(fecha)]}<span class="nut-sem-fecha">${labelCorto(fecha)}</span></div>
     ${slots.map(sl => {
       const p = planDe(fecha, sl.id);
-      const combo = p ? S.combos.find(c => c.id === p.combo_id) : null;
+      const combo = p && p.combo_id ? S.combos.find(c => c.id === p.combo_id) : null;
+      const alimento = p && p.alimento_id ? S.alimentos.find(a => a.id === p.alimento_id) : null;
       let contenido;
       if (combo) {
         contenido = `<span class="nut-celda-combo">${esc(combo.nombre)}</span><span class="nut-celda-prot"><span class="nut-num">${num(combo.prot)}</span> g prot</span>`;
+      } else if (alimento) {
+        contenido = `<span class="nut-celda-combo">${esc(alimento.nombre)}${alimento.porcion ? ` <span class="nut-celda-porcion">${esc(alimento.porcion)}</span>` : ''}</span><span class="nut-celda-prot"><span class="nut-num">${num(alimento.prot)}</span> g prot</span>`;
       } else if (p) {
-        contenido = `<span class="nut-celda-mas">combo no disponible</span>`;
+        contenido = `<span class="nut-celda-mas">${p.alimento_id ? 'alimento' : 'combo'} no disponible</span>`;
       } else {
         contenido = `<span class="nut-celda-mas">+ asignar</span>`;
       }
       return `
-      <button class="nut-celda${combo ? ' nut-celda-llena' : ''}" data-action="celda" data-fecha="${fecha}" data-slot="${esc(sl.id)}">
+      <button class="nut-celda${(combo || alimento) ? ' nut-celda-llena' : ''}" data-action="celda" data-fecha="${fecha}" data-slot="${esc(sl.id)}">
         <span class="nut-celda-slot">${esc(sl.label)}</span>
         ${contenido}
       </button>`;
     }).join('')}
+    <button class="nut-dia-plantilla" data-action="abrir-plantillas" data-fecha="${fecha}">📋 Plantilla</button>
   </div>`;
 }
 
@@ -794,20 +1010,32 @@ function modalCombos() {
   const ctx = S.comboPicker;
   const slot = cfgSlots().find(s => s.id === ctx.slot);
   const actual = planDe(ctx.fecha, ctx.slot);
-  const delSlot = S.combos.filter(c => c.slot === ctx.slot);
-  const otros = S.combos.filter(c => c.slot !== ctx.slot);
+  const t = ctx.tab === 'alimentos' ? 'alimentos' : 'combos';
+  let cuerpo;
+  if (t === 'alimentos') {
+    cuerpo = S.alimentos.length
+      ? S.alimentos.map(a => filaAlimentoPlan(a, actual)).join('')
+      : `<div class="nut-picker-vacio">No hay alimentos cargados. Corré el seed (sql/02_seed_nutricion.sql).</div>`;
+  } else {
+    const delSlot = S.combos.filter(c => c.slot === ctx.slot);
+    const otros = S.combos.filter(c => c.slot !== ctx.slot);
+    cuerpo = `
+        ${!S.combos.length ? `<div class="nut-picker-vacio">No hay combos cargados. Corré el seed (sql/02_seed_nutricion.sql).</div>` : ''}
+        ${delSlot.length ? `<div class="nut-modal-grupo">Combos de ${esc(slot ? slot.label.toLowerCase() : ctx.slot)}</div>${delSlot.map(c => filaComboPlan(c, actual)).join('')}` : ''}
+        ${otros.length ? `<div class="nut-modal-grupo">Otros combos</div>${otros.map(c => filaComboPlan(c, actual)).join('')}` : ''}`;
+  }
   return `
   <div class="nut-modal" data-action="modal-fondo">
-    <div class="nut-modal-card" role="dialog" aria-modal="true" aria-label="Elegir combo">
+    <div class="nut-modal-card" role="dialog" aria-modal="true" aria-label="Asignar al plan">
       <header class="nut-modal-head">
         <h3 class="nut-modal-titulo">${esc(slot ? slot.label : ctx.slot)} · ${labelFecha(ctx.fecha)}</h3>
         <button class="nut-icono" data-action="modal-cerrar" aria-label="Cerrar">✕</button>
       </header>
-      <div class="nut-modal-body">
-        ${!S.combos.length ? `<div class="nut-picker-vacio">No hay combos cargados. Corré el seed (sql/02_seed_nutricion.sql).</div>` : ''}
-        ${delSlot.length ? `<div class="nut-modal-grupo">Combos de ${esc(slot ? slot.label.toLowerCase() : ctx.slot)}</div>${delSlot.map(c => filaComboPlan(c, actual)).join('')}` : ''}
-        ${otros.length ? `<div class="nut-modal-grupo">Otros combos</div>${otros.map(c => filaComboPlan(c, actual)).join('')}` : ''}
+      <div class="nut-picker-tabs nut-modal-tabs">
+        <button class="nut-ptab${t === 'combos' ? ' activa' : ''}" data-action="plan-tab" data-ptab="combos">Combos</button>
+        <button class="nut-ptab${t === 'alimentos' ? ' activa' : ''}" data-action="plan-tab" data-ptab="alimentos">Alimentos</button>
       </div>
+      <div class="nut-modal-body">${cuerpo}</div>
       ${actual ? `<button class="nut-btn-peligro" data-action="plan-quitar">Quitar del plan</button>` : ''}
     </div>
   </div>`;
@@ -824,14 +1052,85 @@ function filaComboPlan(c, actual) {
   </div>`;
 }
 
+function filaAlimentoPlan(a, actual) {
+  const activo = actual && actual.alimento_id === a.id;
+  return `
+  <div class="nut-item${activo ? ' nut-item-activo' : ''}" data-action="plan-asignar-alimento" data-id="${esc(a.id)}" role="button" tabindex="0">
+    <div class="nut-item-info">
+      <div class="nut-item-nombre">${esc(a.nombre)}${a.porcion ? ` <span class="nut-item-porcion">${esc(a.porcion)}</span>` : ''}${activo ? ' ✓' : ''}</div>
+      <div class="nut-item-macros"><span class="nut-num">${num(a.prot)}</span> g prot · ${num(a.kcal)} kcal</div>
+    </div>
+  </div>`;
+}
+
+/* ---------- Modal de plantillas de día ---------- */
+function nombreItemPlantilla(it) {
+  if (it.tipo === 'combo') {
+    const c = S.combos.find(x => x.id === it.item_id);
+    return c ? c.nombre : 'no disponible';
+  }
+  const a = S.alimentos.find(x => x.id === it.item_id);
+  return a ? (a.porcion ? a.nombre + ' (' + a.porcion + ')' : a.nombre) : 'no disponible';
+}
+
+function filaPlantilla(pl) {
+  const slots = cfgSlots();
+  const items = Array.isArray(pl.items) ? pl.items : [];
+  const partes = items.map(it => {
+    const sl = slots.find(s => s.id === it.slot);
+    return (sl ? sl.label : it.slot) + ': ' + nombreItemPlantilla(it);
+  });
+  return `
+  <div class="nut-item" data-action="plantilla-aplicar" data-id="${esc(pl.id)}" role="button" tabindex="0">
+    <div class="nut-item-info">
+      <div class="nut-item-nombre">${esc(pl.nombre)}</div>
+      <div class="nut-item-macros">${partes.length ? esc(partes.join(' · ')) : 'Sin items'}</div>
+    </div>
+    <button class="nut-icono nut-borrar" data-action="plantilla-borrar" data-id="${esc(pl.id)}" aria-label="Borrar plantilla" title="Borrar plantilla">🗑</button>
+  </div>`;
+}
+
+function modalPlantillas() {
+  const ctx = S.plantillaModal;
+  const items = itemsDelDia(ctx.fecha);
+  let lista;
+  if (S.diasTipo.length) {
+    lista = `<div class="nut-modal-grupo">Tap para aplicar al día (los slots que la plantilla no cubre quedan como están)</div>`
+      + S.diasTipo.map(filaPlantilla).join('');
+  } else {
+    lista = `<div class="nut-picker-vacio">Todavía no tenés plantillas de día.<br>${items.length
+      ? 'Guardá este día con el formulario de abajo y después aplicala a cualquier otro día en 1 tap.'
+      : 'Armá un día asignando combos o alimentos a sus slots y guardalo como plantilla desde acá.'}</div>`;
+  }
+  return `
+  <div class="nut-modal" data-action="plantilla-fondo">
+    <div class="nut-modal-card" role="dialog" aria-modal="true" aria-label="Plantillas de día">
+      <header class="nut-modal-head">
+        <h3 class="nut-modal-titulo">📋 Plantillas · ${labelFecha(ctx.fecha)}</h3>
+        <button class="nut-icono" data-action="plantilla-cerrar" aria-label="Cerrar">✕</button>
+      </header>
+      <div class="nut-modal-body">
+        ${lista}
+        ${items.length ? `
+        <div class="nut-modal-grupo">Guardar este día como plantilla</div>
+        <form class="nut-plantilla-form" data-action="guardar-plantilla">
+          <input class="nut-input" name="nombre" placeholder="Nombre de la plantilla" required maxlength="80" autocomplete="off" aria-label="Nombre de la plantilla">
+          <button type="submit" class="nut-btn-primario">Guardar</button>
+        </form>` : ''}
+      </div>
+    </div>
+  </div>`;
+}
+
 /* ---------- Tab PREP ---------- */
 function vistaPrep() {
   const nav = navSemana();
   if (S.cargando) return nav + `<div class="nut-cargando">Cargando la semana…</div>`;
   const { combos, ingredientes } = resumenSemana();
-  if (!combos.length) return nav + vacioPlan();
+  if (!combos.length && !ingredientes.length) return nav + vacioPlan();
   return nav + `
   <div class="nut-prep">
+    ${combos.length ? `
     <section class="nut-card">
       <h3 class="nut-card-titulo">🍳 A cocinar esta semana</h3>
       ${combos.map(({ combo, veces }) => `
@@ -839,7 +1138,7 @@ function vistaPrep() {
         <div class="nut-prep-nombre">${esc(combo.nombre)}${combo.slot ? ` <span class="nut-item-porcion">${esc(combo.slot)}</span>` : ''}</div>
         <div class="nut-prep-veces">× ${veces}</div>
       </div>`).join('')}
-    </section>
+    </section>` : ''}
     <section class="nut-card">
       <h3 class="nut-card-titulo">🧺 Ingredientes para el batch</h3>
       ${ingredientes.length ? ingredientes.map(i => `
@@ -991,6 +1290,9 @@ const CSS = `
 .nut-celda-combo { font-size: .84rem; font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
 .nut-celda-prot { font-size: .74rem; color: var(--accent); }
 .nut-celda-mas { font-size: .82rem; color: var(--text-dim); }
+.nut-celda-porcion { font-size: .72rem; font-weight: 400; color: var(--text-faint); }
+.nut-dia-plantilla { width: 100%; min-height: 44px; background: transparent; border: 1px dashed var(--border-strong); border-radius: var(--radius); color: var(--text-dim); font-size: .8rem; transition: color .15s, border-color .15s, background .15s; }
+.nut-dia-plantilla:hover, .nut-dia-plantilla:active { color: var(--accent-2); border-color: var(--accent-2); background: var(--accent-2-soft); }
 
 /* Modal combos */
 .nut-modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-end; justify-content: center; background: color-mix(in srgb, var(--bg) 75%, transparent); backdrop-filter: blur(2px); }
@@ -1000,6 +1302,17 @@ const CSS = `
 .nut-modal-body { flex: 1; overflow-y: auto; }
 .nut-modal-grupo { font-size: .72rem; text-transform: uppercase; letter-spacing: .07em; color: var(--text-faint); margin: var(--space-3) 0 var(--space-1); }
 .nut-modal-grupo:first-child { margin-top: 0; }
+.nut-modal-tabs { margin-bottom: var(--space-3); }
+.nut-plantilla-form { display: flex; gap: var(--space-2); margin-top: var(--space-1); }
+.nut-plantilla-form .nut-input { flex: 1; min-width: 0; }
+.nut-plantilla-form .nut-btn-primario { flex: none; }
+
+/* Chip "Planificado" en Hoy */
+.nut-plan-chip { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); min-height: 52px; margin: var(--space-2) 0; padding: var(--space-2) var(--space-3); background: var(--accent-2-soft); border: 1px solid var(--border); border-radius: var(--radius); font-size: .84rem; color: var(--text-dim); }
+.nut-plan-chip-txt { min-width: 0; overflow-wrap: anywhere; }
+.nut-plan-chip strong { color: var(--text); font-weight: 600; }
+.nut-plan-chip-btn { flex: none; min-height: 40px; padding: var(--space-1) var(--space-4); background: var(--accent-2); border: none; border-radius: 999px; color: var(--bg); font-weight: 700; font-size: .8rem; transition: opacity .15s; }
+.nut-plan-chip-btn:hover { opacity: .9; }
 
 /* Prep */
 .nut-prep-fila { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); min-height: 44px; padding: var(--space-1) 0; border-bottom: 1px solid var(--border); }
@@ -1063,6 +1376,7 @@ export default {
     S.semana = lunesDe(hoyStr());
     S.picker = null;
     S.comboPicker = null;
+    S.plantillaModal = null;
     inyectarEstilos();
     bind();
     if (!supabase) {
@@ -1108,7 +1422,7 @@ export default {
     // Refresco silencioso al volver de otra ruta (multi-device)
     if (Date.now() - S.ultimaCarga > 30000) {
       S.ultimaCarga = Date.now();
-      Promise.all([cargarLog(), cargarPlan()])
+      Promise.all([cargarLog(), cargarPlan(), cargarCatalogo()])
         .then(() => paint())
         .catch(() => { /* silencioso: la data pintada coincide con su label */ });
     }
