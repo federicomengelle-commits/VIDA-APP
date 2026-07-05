@@ -331,3 +331,73 @@ rutina_checks (
 
 ## 11. Registro de módulos nuevos
 `js/app.js` (owner: integrador principal, NO los agentes): flip de `enabled: true` + `loader` para plata y rutina en MODULES. Los módulos deben exportar default con los ids EXACTOS 'plata' y 'rutina' (app.js valida mod.id).
+
+---
+
+## 12. Módulo Training — Fase 4 v1 (owner SQL-TRAINING: sql/06_training.sql · owner MOD-TRAINING: js/modules/training.js)
+
+**Alcance v1:** registrar entrenamientos (sesión → ejercicios → sets con peso/reps) + ver evolución por ejercicio. Benchmark UX Harbiz pero NO clonarlo: arranca simple, foco en registrar rápido y ver progreso. SIN plantillas de rutina de gym en v1 (se puede sumar después), SIN importar de Harbiz todavía.
+
+### SQL (06_training.sql — idempotente, mismo estilo/RLS que 00-05)
+```sql
+training_ejercicios (            -- catálogo de ejercicios del usuario (editable)
+  id uuid PK default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  nombre text not null,
+  grupo text,                    -- id de config 'grupos' (ej. 'pecho','espalda','pierna'...)
+  unidad text not null default 'kg',   -- unidad de carga
+  nota text,
+  _deleted boolean default false,
+  created_at timestamptz default now()
+)
+training_sesiones (             -- una sesión = un día de entreno
+  id uuid PK default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  fecha date not null,
+  nombre text,                   -- opcional ('Push A', 'Pierna'...)
+  nota text,
+  _deleted boolean default false,
+  created_at timestamptz default now()
+)
+training_sets (                 -- cada serie registrada
+  id uuid PK default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  sesion_id uuid not null references training_sesiones(id) on delete cascade,
+  ejercicio_id uuid not null references training_ejercicios(id),
+  orden integer default 0,       -- orden del ejercicio dentro de la sesión
+  set_num integer default 1,     -- número de serie
+  peso numeric default 0,
+  reps integer default 0,
+  rpe numeric,                   -- esfuerzo percibido opcional (RPE 1-10)
+  completado boolean default true,
+  created_at timestamptz default now()
+)
+```
+- SIN check constraints sobre grupo/unidad (config por usuario). Índices: `training_sesiones (user_id, fecha)`, `training_sets (user_id, ejercicio_id)`, `training_sets (sesion_id)`. RLS 4 políticas por tabla.
+- Seed `user_config` módulo `training` (upsert): `grupos` → `[{"id":"pecho","label":"Pecho"},{"id":"espalda","label":"Espalda"},{"id":"pierna","label":"Pierna"},{"id":"hombro","label":"Hombro"},{"id":"brazo","label":"Brazo"},{"id":"core","label":"Core"},{"id":"otro","label":"Otro"}]` · `unidades` → `["kg","lb","placas","seg"]`.
+- Seed ejercicios base (guard anti-duplicado user_id+nombre): `Press banca` (pecho), `Sentadilla` (pierna), `Peso muerto` (espalda), `Press militar` (hombro), `Dominadas` (espalda), `Remo con barra` (espalda). unidad 'kg'. Editables.
+
+### Módulo training.js (prefijo CSS `tra-`, interfaz canónica §4, id 'training', label 'Training')
+3 tabs: **Sesión** (default) · **Historial** · **Progreso**.
+- **Sesión (hoy por default, fecha navegable):** si no hay sesión ese día → botón "Empezar sesión" (crea training_sesiones). Con sesión: nombre editable opcional. Lista de ejercicios de la sesión (ordenados por `orden`), cada uno con sus sets en filas compactas [peso × reps] editables inline (input peso, input reps, RPE opcional). Botones: "+ Set" (agrega set al ejercicio; pre-llena peso/reps del último set), "+ Ejercicio" (picker del catálogo con búsqueda + crear ejercicio nuevo inline: nombre + grupo). Borrar set/ejercicio con confirm. Muestra por ejercicio el **último registro previo** de ese ejercicio (peso×reps máximos de la última sesión) como referencia para saber cuánto meter. Volumen de la sesión (Σ peso×reps) en el header. Mobile-first: inputs numéricos grandes, inputmode.
+- **Historial:** lista de sesiones (más nueva arriba), cada una con fecha, nombre, resumen (n ejercicios, n sets, volumen total). Tap → expandir detalle (ejercicios + sets). Borrar sesión (soft) con confirm.
+- **Progreso:** selector de ejercicio → gráfico simple de evolución (SVG inline, sin libs): mejor set por sesión en el tiempo (peso, o peso×reps estimando 1RM Epley = peso×(1+reps/30)). Mostrar PR (récord) y última vs. anterior. Si no hay data, guía.
+- Guards anti doble-tap; guard anti-carrera en navegación de fecha (patrón nutricion). Queries `.eq('user_id')` + `_deleted=false` donde exista. Cero hardcodeo (grupos/unidades/ejercicios desde config y tablas; los del usuario solo en seed). Estilos solo con var(--token) del §6.
+
+## 13. Módulo Insights — Fase 5a v1 determinístico (owner MOD-INSIGHTS: js/modules/insights.js · SIN SQL nuevo, SIN API key)
+
+**Alcance v1:** dashboard client-side que LEE (nunca escribe) las tablas de los demás módulos y muestra un chequeo cruzado con números reales. NADA de IA todavía — la capa de sugerencias en lenguaje natural (5b, Claude API) se suma después sin tocar esto. Prepara el terreno: dejar un placeholder claro de "Sugerencias IA (próximamente)".
+
+### Módulo insights.js (prefijo CSS `ins-`, interfaz canónica §4, id 'insights', label 'Insights')
+- NO tiene tablas propias ni SQL. Lee de: `nutricion_log`, `nutricion_plan`, `plata_movimientos`, `plata_objetivos`, `rutina_rutinas`, `rutina_checks`, `training_sesiones`, `training_sets`, y `user_config` (via config core para targets/objetivos). Todas las lecturas con `.eq('user_id')` + `_deleted=false` donde exista. Tolerante a módulos sin datos o tablas ausentes (si una query falla, esa card muestra "sin datos" — NUNCA romper el dashboard; patrón: cada bloque en su try/catch).
+- Layout: cards de resumen (una por dominio) + selector de rango (Hoy / 7 días / 30 días donde aplique).
+  - **Nutrición:** proteína de hoy vs. target (de user_config nutricion.proteina_target), promedio de proteína últimos 7 días vs. target, días que llegó al piso. 
+  - **Plata:** balance del mes en curso por moneda, gasto del mes vs. mes anterior, progreso del objetivo activo principal (aportado vs. target).
+  - **Rutina:** adherencia global 7 días (checks hechos / posibles), racha, rutina con mejor/peor adherencia.
+  - **Training:** sesiones últimos 7/30 días, volumen total, último PR registrado.
+  - **Cruces (lo jugoso, determinístico):** ej. "adherencia de rutina vs. proteína promedio", "gasto en Gym/Salud vs. sesiones de training", "días sin entrenar". Solo cruces calculables con la data; si falta un lado, se omite la card.
+- **Card destacada "Sugerencias" con estado `próximamente`:** explica que las sugerencias personalizadas por IA (y la captura por audio) llegan en la próxima fase. NO simular respuestas de IA. Botón/nota que remite a que requiere configurar la API key (Fase 5b).
+- Todo client-side, read-only, es-AR, mobile-first, solo var(--token). Sin guards de escritura (no escribe). Loading states por card. Refetch al entrar.
+
+## 14. Registro de Training e Insights
+`js/app.js` (owner integrador): flip `enabled: true` + `loader` para 'training' e 'insights' en MODULES. Ids EXACTOS 'training' e 'insights'. Correr sql/06_training.sql en Supabase antes de usar Training (Insights no necesita SQL nuevo).

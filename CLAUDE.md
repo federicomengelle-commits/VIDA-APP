@@ -122,7 +122,15 @@ Cada fase es un milestone ejecutable con su propio prompt para Claude Code. **No
 
 **Fase 4 — Training.** Rutina, series, pesos, evolución. Benchmark de UX: Harbiz — pero NO clonarlo. Arranca simple, enfocado donde Harbiz no te cubre. Evaluar si conviene importar data de Harbiz en vez de duplicar.
 
-**Fase 5 — Motor de IA / Insights.** VA AL FINAL: necesita data histórica de las fases 1-4 para tener qué interpretar. Lee las tablas de todos los módulos y genera insights cruzados (ej: adherencia a rutina vs. evolución de peso; gasto vs. objetivo). Implementación: backend llama a la API de Claude con la data del usuario → devuelve insights estructurados. Corre periódico, no en cada request.
+**Fase 5 — Motor de IA / Insights.** Necesita data histórica de las fases 1-4 para tener qué interpretar. Se construye en dos capas:
+- **5a — Insights determinísticos (sin API key).** Dashboard client-side que lee las tablas de todos los módulos y genera cruces calculables: proteína vs. target, adherencia de rutina, gasto del mes vs. objetivo, evolución de training. Útil por sí solo y no bloquea en credenciales.
+- **5b — Capa de IA (requiere `ANTHROPIC_API_KEY` en Vercel + serverless `/api`).** Sobre la base determinística, la Claude API genera **sugerencias en lenguaje natural** ("reforzá proteína hoy", "vas corto para el objetivo de propiedad") e insights cruzados más ricos. Corre on-demand / periódico, no en cada request.
+
+**Visión de captura (el diferencial — se implementa con la capa 5b):**
+- **Captura universal por audio (LA joya).** Un captador único (botón de micrófono global): Fede manda un audio con cualquier cosa ("gasté 5 lucas en el súper", "almorcé 250g de carne", "press banca 4x10 con 80kg") → transcripción → Claude API entiende QUÉ es y a QUÉ módulo va → **lo acomoda solo** en la tabla correcta (Plata/Nutrición/Rutina/Training). Cero clics, cero data entry. Es el "principio rector" (§0) en su forma final.
+- **Foto al plato → nutrientes (futuro).** Sacar foto de la comida y que Claude (visión) reconozca la composición de macros y la cargue en Nutrición.
+
+Ambas necesitan la API key + serverless functions y arrancan cuando el dueño la provea. La base (módulos + tablas + insights determinísticos) se termina primero.
 
 **Fase 6 — Capa de producto** (solo si el core validó para el dueño). Onboarding (setup de config del nuevo usuario), billing, landing, mecánica de viralización. El core ya es multi-tenant, así que esto se suma encima sin tocar la lógica.
 
