@@ -4,6 +4,7 @@ import { initAuth, login, logout, getUser, onAuthChange } from './core/auth.js';
 import { loadConfig } from './core/config.js';
 import { registerModule, startRouter, navigate } from './core/router.js';
 import { toast, confirmDialog } from './core/ui.js';
+import { initCaptura } from './core/captura.js';
 
 const MODULES = [
   { id: 'nutricion', label: 'Nutrición', icon: '🥩', enabled: true,  loader: () => import('./modules/nutricion.js') },
@@ -232,6 +233,7 @@ async function enterApp(user) {
     }
 
     await startRouter('nutricion');
+    initCaptura(); // captador universal (voz + texto); idempotente
   } catch (err) {
     console.error('[app] enterApp falló:', err);
     toast('Algo falló al iniciar la app.', 'error');

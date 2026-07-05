@@ -401,3 +401,51 @@ training_sets (                 -- cada serie registrada
 
 ## 14. Registro de Training e Insights
 `js/app.js` (owner integrador): flip `enabled: true` + `loader` para 'training' e 'insights' en MODULES. Ids EXACTOS 'training' e 'insights'. Correr sql/06_training.sql en Supabase antes de usar Training (Insights no necesita SQL nuevo).
+
+---
+
+## 15. Captura universal (voz + texto) v0 — SIN API key (owner CAPTURA: js/core/captura.js · wiring en app.js lo hace el integrador)
+
+**Idea (el diferencial de VIDA, §0 CLAUDE.md):** un captador global. El usuario dice o escribe UNA línea ("gasté 5 lucas en el súper", "almorcé 250 de carne", "tomé la creatina", "press banca 4x10 con 80") → la app la entiende, **muestra qué entendió para que confirme/edite**, y lo inserta en el módulo correcto. Cero navegación manual.
+
+**v0 sin IA (lo que se construye ahora):** transcripción por **Web Speech API del navegador** (gratis, sin key; en Android/Chrome anda) + **parser determinístico es-AR** + **paso de confirmación obligatorio**. Cuando llegue la `ANTHROPIC_API_KEY` (Fase 5b), el parser se reemplaza por una llamada a Claude vía serverless `/api/parse` SIN tocar la UI: dejar un seam claro (`async function interpretar(texto)` es el único punto que cambia). NUNCA auto-commitea: el usuario siempre revisa antes de guardar. Eso hace la feature SEGURA aunque el parser v0 se equivoque.
+
+### Archivo: js/core/captura.js
+```js
+export function initCaptura()   // lo llama app.js tras startRouter (usuario logueado)
+```
+- Importa `supabase` de `./supabase.js`, `getUserId` de `./auth.js`, `getConfig` de `./config.js`, `toast` de `./ui.js`, `navigate` de `./router.js`. NO importa módulos.
+- Inyecta (1 sola vez) un **botón flotante de micrófono** 🎤 (FAB): desktop abajo-derecha; mobile arriba del bottom-nav (respetar safe-area, no tapar la nav). Y un overlay de captura. Clases prefijo `cap-`, `<style id="cap-styles">` inyectado 1 vez, SOLO var(--token) del §6.
+- Estilos e interacción mobile-first (se usa con una mano, hablando).
+
+### Flujo de la UI
+1. Tap en 🎤 → abre overlay con: botón grande de grabar (usa `webkitSpeechRecognition`/`SpeechRecognition`, lang 'es-AR' con fallback 'es-419'/'es-ES') **y** un `<textarea>` (para escribir o corregir lo transcripto). Si STT no está disponible en el browser, se oculta el botón de voz y queda solo el texto (la feature sigue 100% usable). Mientras graba: feedback visual (pulso) + transcripción en vivo en el textarea.
+2. El usuario habla/escribe y toca **"Entender"** → `interpretar(texto)` devuelve una **propuesta** estructurada.
+3. **Card de confirmación** (lo central): muestra el módulo detectado + los campos ya cargados y **EDITABLES** (selector de módulo por si se equivocó, y los campos según módulo). Muestra el texto crudo. Botones **"Guardar"** y **"Cancelar"**. Confianza baja → banner "Revisá bien lo que entendí".
+4. **Guardar** → inserta en la tabla del módulo (abajo) con guard anti doble-tap → toast "Anotado en <Módulo>" + acción "Ver" que hace `navigate('<modulo>')`. Cierra el overlay.
+
+### Parser determinístico `interpretar(texto)` → propuesta
+Devuelve `{ modulo, confianza: 'alta'|'media'|'baja', campos, resumen, crudo }` o `{ modulo: null, crudo }` si no pudo. Normaliza (minúsculas, sin acentos) para matchear. es-AR:
+- **Montos:** "5 lucas"/"cinco lucas"/"5 luca" → 5000; "5 mil"/"5k" → 5000; "una luca" → 1000; "$1.500"/"1500 pesos"/"mil quinientos" → 1500; "20 dólares"/"20 usd"/"20 verdes" → monto 20 moneda USD (default moneda = primera de config `plata.monedas`). Números en palabras básicos (uno..diez, veinte, treinta, cien, mil).
+- **Fecha:** "hoy" (default) · "ayer" · "anteayer" · "el lunes/martes..." → fecha local resuelta.
+- **Plata — egreso:** disparadores gasté/pagué/compré/"me salió"/"se me fue"/gasto. **ingreso:** cobré/"me pagaron"/ingresó/"me entró"/facturé. ámbito: "de mepex"/"del laburo"/"trabajo" → id 'mepex' si existe en config, si no 'personal' (o el primero de config `plata.ambitos`). categoría: matchear el resto del texto contra `plata.categorias[tipo]` de config por contains/keywords (súper/comida→Comida, nafta/uber/bondi→Transporte, etc.), si no matchea → null (el usuario la elige en la card). fuente: null v0.
+- **Nutrición — comida:** disparadores comí/almorcé/cené/merendé/desayuné/"me tomé un batido". slot por el verbo (almorcé→almuerzo, cené→cena, merendé/desayuné→merienda) o el primer slot de config `nutricion.slots`. Matchear ítems del texto contra el catálogo del usuario (query `nutricion_alimentos` + `nutricion_combos`, contains sobre nombre) → sumar macros de los matcheados; permitir cantidad ("2 huevos"). Si no matchea nada → proponer entrada manual con nombre = texto y macros 0 (el usuario completa).
+- **Training:** disparadores entrené/hice + nombre de ejercicio (match contra `training_ejercicios`) + patrón "NxM con P" o "N por M con P kg" (4x10 con 80) → sets. Si falta la tabla (sql/06 sin correr) → confianza baja y sugerir revisar.
+- **Rutina — hábito:** "tomé la creatina"/"hice skincare"/"me tomé los suplementos" → matchear contra items de las `rutina_rutinas` activas del usuario → marcar esos checks para la fecha.
+- Confianza: **alta** si intent claro + campo clave extraído; **media** si falta algo (ej. categoría); **baja** si intent adivinado. Cualquier confianza pasa por la card de confirmación (nunca commit directo).
+
+### Inserts por módulo (respetar el esquema EXACTO de los sql/; leerlos)
+- **Plata:** `plata_movimientos` con `{ user_id, fecha, tipo, monto, moneda, ambito, categoria, descripcion, origen: 'voz'|'texto', crudo: <texto original> }`. (origen y crudo YA existen en el esquema — usarlos.)
+- **Nutrición:** una fila por ítem en `nutricion_log` `{ user_id, fecha, slot, item_tipo: 'alimento'|'combo'|'custom', item_id, item_nombre, prot, carbo, grasa, kcal }`.
+- **Rutina:** filas en `rutina_checks` `{ user_id, fecha, rutina_id, item_id }` (respetar el unique; ignorar 23505 como ya-hecho).
+- **Training:** crear/reusar `training_sesiones` del día + `training_sets` por serie (mismos campos que training.js).
+- TODAS con `user_id = getUserId()`. Nunca insertar sin confirmación del usuario.
+
+### Reglas
+- Cero hardcodeo de valores del usuario: monedas/ámbitos/categorías/slots SIEMPRE de config; catálogo de las tablas. Los keywords del parser (gasté, súper, etc.) son léxico del idioma, NO valores del usuario — permitidos.
+- El seam de IA: `interpretar()` debe estar aislado para que en 5b se cambie por la llamada a Claude sin tocar UI ni inserts.
+- esc() en todo dato dinámico. Guards anti doble-tap. Tolerante a tablas ausentes (módulo sin SQL corrido → confianza baja + aviso, no romper).
+- El botón 🎤 no debe tapar contenido ni la bottom-nav en mobile.
+
+### Wiring (owner integrador, en app.js — NO lo hace el agente de captura)
+`import { initCaptura } from './core/captura.js'` y llamar `initCaptura()` al final de enterApp (tras startRouter). Se limpia/re-inyecta solo en logout→login sin duplicar el FAB.
