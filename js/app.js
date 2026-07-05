@@ -7,8 +7,8 @@ import { toast, confirmDialog } from './core/ui.js';
 
 const MODULES = [
   { id: 'nutricion', label: 'Nutrición', icon: '🥩', enabled: true,  loader: () => import('./modules/nutricion.js') },
-  { id: 'plata',     label: 'Plata',     icon: '💵', enabled: false },  // Fase 2
-  { id: 'rutina',    label: 'Rutina',    icon: '☀️', enabled: false },  // Fase 3
+  { id: 'plata',     label: 'Plata',     icon: '💵', enabled: true,  loader: () => import('./modules/plata.js') },
+  { id: 'rutina',    label: 'Rutina',    icon: '☀️', enabled: true,  loader: () => import('./modules/rutina.js') },
   { id: 'training',  label: 'Training',  icon: '🏋️', enabled: false },  // Fase 4
   { id: 'insights',  label: 'Insights',  icon: '🧠', enabled: false },  // Fase 5
 ];

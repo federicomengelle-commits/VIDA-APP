@@ -241,3 +241,93 @@ nutricion_dias_tipo (
 - **Prep y Compras**: los alimentos planificados entran a la agregación como ingrediente `{nombre, cantidad: veces, unidad: '× ' + porcion}` → se ve "Carne roja magra: 3 × 250 g". Combos igual que hoy.
 - **Hoy**: si un slot está vacío y hay plan para hoy en ese slot → chip "Planificado: <nombre>" con botón anotar de 1 tap (snapshot de macros actuales del combo/alimento). Cierra el loop plan→log sin fricción.
 - `S.diasTipo` se carga en init junto al catálogo y se refresca con el refetch silencioso. Cero hardcodeo de slots/valores (todo sigue saliendo de config y tablas). Data-actions nuevos por el onClick delegado existente. Clases prefijo `nut-`.
+
+---
+
+## 9. Módulo Plata — Fase 2 v1 (owner SQL-PLATA: sql/04_plata.sql · owner MOD-PLATA: js/modules/plata.js)
+
+**Alcance v1:** captura rápida manual + categorización + resumen + objetivos. La captura por audio/foto con IA llega con el motor de Fase 5 — el esquema YA la prevé (`origen`, `crudo`) pero NO se implementa nada de IA ahora.
+
+### SQL (04_plata.sql — idempotente, mismo estilo/RLS que 00-03)
+```sql
+plata_objetivos (
+  id uuid PK default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  nombre text not null,
+  target_monto numeric,                -- null = sin definir todavía
+  moneda text not null default 'USD',
+  nota text,
+  activo boolean default true,
+  _deleted boolean default false,
+  created_at timestamptz default now()
+)
+plata_movimientos (
+  id uuid PK default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  fecha date not null,
+  tipo text not null,                  -- 'ingreso' | 'egreso'
+  monto numeric not null,
+  moneda text not null default 'ARS',
+  ambito text not null,                -- id de config 'ambitos' (ej. 'personal' | 'mepex')
+  categoria text,
+  descripcion text,
+  fuente text,                         -- de dónde viene / a dónde va (ej. 'MEPEX', 'Mercado Pago')
+  objetivo_id uuid references plata_objetivos(id),  -- si es aporte a un objetivo
+  origen text not null default 'manual',            -- 'manual' | 'voz' | 'foto' (IA, Fase 5)
+  crudo text,                          -- input crudo original si vino de captura (Fase 5)
+  _deleted boolean default false,
+  created_at timestamptz default now()
+)
+```
+- SIN check constraints sobre tipo/ambito/categoria/moneda (config por usuario). Índice `(user_id, fecha)` en movimientos. RLS 4 políticas por tabla.
+- Seed `user_config` módulo `plata` (upsert): `monedas` → `["ARS","USD"]` · `ambitos` → `[{"id":"personal","label":"Personal"},{"id":"mepex","label":"MEPEX"}]` · `categorias` → `{"ingreso":["MEPEX","Otros"],"egreso":["Vivienda","Comida","Transporte","Salud","Gym","Suscripciones","Salidas","Compras","Impuestos","Otros"]}`.
+- Seed objetivo: `Compra de propiedad` (moneda USD, target_monto null, nota 'Definí el monto objetivo desde la app', activo). Guard anti-duplicado (user_id, nombre).
+
+### Módulo plata.js (prefijo CSS `pla-`, interfaz canónica §4, id 'plata', label 'Plata')
+3 tabs: **Mes** (default) · **Resumen** · **Objetivos**. Mes visible navegable ‹ › (default mes actual).
+- **Mes**: form de captura rápida SIEMPRE visible arriba (mobile-first, 1 mano): toggle Ingreso/Egreso, monto (teclado numérico), moneda (chips desde config), ámbito (chips desde config), categoría (select según tipo desde config), descripción corta opcional, fecha default hoy editable. Guardar → insert + toast + form se limpia (foco al monto). Lista de movimientos del mes agrupada por día (más nuevo arriba): tipo/categoría/ámbito/descr + monto con signo y color (--ok ingreso, --danger egreso), badge de ámbito. Borrar con confirmDialog (soft delete). Estados vacíos con guía.
+- **Resumen** (del mes visible, calculado client-side on-demand): por moneda: total ingresos, total egresos, balance. Split ESTRICTO por ámbito (personal vs mepex, labels desde config). Breakdown de egresos por categoría con barras proporcionales (var(--accent-2)). Si hay aportes a objetivos en el mes, línea "Aportado a objetivos".
+- **Objetivos**: cards: nombre, progreso = suma de movimientos con ese objetivo_id (no _deleted) en la moneda del objetivo vs target_monto (barra --accent; si target null → mostrar total aportado + botón "Definir target"), botón "Aportar" (mini-form monto+fecha → insert movimiento tipo 'egreso', ambito 'personal' por default editable, categoria 'Objetivos', objetivo_id seteado), crear objetivo (nombre/target/moneda/nota), editar target/nota, archivar (activo=false) con confirm. 
+- Formato es-AR: $ 1.234.567 (sin decimales) para ARS, US$ con decimales solo si hay. `Intl.NumberFormat('es-AR')`.
+- Guards anti doble-tap en todo insert/update (patrón S.mutando de nutricion). Queries siempre `.eq('user_id')` + `.eq('_deleted', false)`. Cero hardcodeo: monedas/ámbitos/categorías SIEMPRE desde config con fallback [] y estado vacío que guía a correr sql/04.
+
+## 10. Módulo Rutina — Fase 3 v1 (owner SQL-RUTINA: sql/05_rutina.sql · owner MOD-RUTINA: js/modules/rutina.js)
+
+**Alcance v1:** rutinas con checklist diario + registro de adherencia. SIN notificaciones (Calendar+Apps Script llega después).
+
+### SQL (05_rutina.sql — idempotente, mismo estilo/RLS)
+```sql
+rutina_rutinas (
+  id uuid PK default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  nombre text not null,
+  icono text,                          -- emoji
+  items jsonb not null default '[]',   -- [{"id":"<uuid-o-slug>","label":"Creatina 3-5 g","nota":""}]
+  dias jsonb not null default '[]',    -- [0..6] lunes=0; días en que aplica. [] = solo lanzamiento manual
+  activa boolean default true,
+  orden integer default 0,
+  _deleted boolean default false,
+  created_at timestamptz default now()
+)
+rutina_checks (
+  id uuid PK default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  fecha date not null,
+  rutina_id uuid not null references rutina_rutinas(id) on delete cascade,
+  item_id text not null,
+  created_at timestamptz default now(),
+  unique (user_id, fecha, rutina_id, item_id)
+)
+```
+- Índice `(user_id, fecha)` en checks. RLS 4 políticas por tabla.
+- Seed: rutina `Mañana` (icono ☀️, dias [0,1,2,3,4,5,6], orden 0) con items: `creatina` → "Creatina monohidrato 3-5 g" (nota "todos los días — por saturación, no timing"), `suplementos-am` → "Suplementos AM", `skincare` → "Skincare". Guard anti-duplicado (user_id, nombre). Es ejemplo editable, no dogma.
+
+### Módulo rutina.js (prefijo CSS `rut-`, interfaz canónica §4, id 'rutina', label 'Rutina')
+3 tabs: **Hoy** (default) · **Rutinas** · **Adherencia**.
+- **Hoy**: fecha navegable ‹ hoy ›. Muestra las rutinas activas cuyo `dias` incluye el día visible (lunes=0) + las de `dias:[]` solo si tienen algún check ese día o se lanzan con botón "+ Lanzar rutina" (picker de las manuales). Por rutina: card con icono, nombre, progreso x/y + barra, checklist de items con tap-target grande; tap = toggle (insert en rutina_checks / delete del check; optimista con revert en error). Al completar todas → mini celebración (borde --ok + "Completa 💪"). Estados vacíos con guía.
+- **Rutinas**: lista + crear/editar: nombre, emoji, días de la semana (chips L M X J V S D), items dinámicos (agregar/quitar/reordenar simple con ↑↓, label + nota opcional; id = slug estable del label al crear, NO regenerar al editar label si ya existe). Desactivar (activa=false) y borrar (soft) con confirm. Al editar items de una rutina, los checks históricos quedan (referencian item_id viejo — no romper Adherencia).
+- **Adherencia**: últimos 7 y 30 días (toggle): por rutina, % = checks hechos / (items × días aplicables en el rango, contando solo días donde la rutina aplicaba por `dias`); grilla de días (fila por rutina, celda por día: vacío/parcial/completo con --danger/--warn/--ok suave) + racha actual de días completos. Client-side con 1 query de checks del rango.
+- Guards anti doble-tap en toggles. Queries `.eq('user_id')` + `_deleted=false` donde exista. Cero hardcodeo (la rutina seedeada es DATA, no código).
+
+## 11. Registro de módulos nuevos
+`js/app.js` (owner: integrador principal, NO los agentes): flip de `enabled: true` + `loader` para plata y rutina en MODULES. Los módulos deben exportar default con los ids EXACTOS 'plata' y 'rutina' (app.js valida mod.id).

@@ -114,3 +114,14 @@ Quedaron tres datos provisorios que conviene confirmar y corregir desde la app (
 Crea la tabla de plantillas de día, le agrega la columna `alimento_id` al plan semanal y te deja armada la plantilla "Día tipo" (almuerzo: carne roja magra 250 g · merienda: Batido · cena: Tostado). Idempotente como los demás.
 
 Si estás instalando de cero: corré el 03 después del seed (02), así la plantilla encuentra sus alimentos y combos.
+
+---
+
+## Actualización — Plata y Rutina (`sql/04_plata.sql` y `sql/05_rutina.sql`)
+
+Módulos nuevos: **Plata** (Fase 2) y **Rutina** (Fase 3). Para activarlos, corré los dos SQL en el **SQL Editor** (necesitan tu usuario ya creado, igual que el resto):
+
+- [ ] Pegá TODO `sql/04_plata.sql` → **Run**. Crea las tablas de movimientos y objetivos, tu config de Plata (monedas ARS/USD, ámbitos Personal/MEPEX, categorías) y el objetivo "Compra de propiedad".
+- [ ] Pegá TODO `sql/05_rutina.sql` → **Run**. Crea las tablas de rutinas y checks, y te deja armada la rutina "Mañana" (creatina · suplementos AM · skincare).
+
+Los dos son idempotentes. Después recargá la app: en el menú ya vas a poder entrar a **Plata** y **Rutina**. Todo lo de esos módulos (categorías, ámbitos, ítems de rutina) es editable desde la app o en Table Editor.
