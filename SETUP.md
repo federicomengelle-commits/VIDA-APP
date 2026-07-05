@@ -98,5 +98,6 @@ Quedaron tres datos provisorios que conviene confirmar y corregir desde la app (
 ## Si algo falla
 
 - **Login rechazado**: revisá que el usuario esté "Confirmed" en Authentication → Users, y que `env.js` tenga la URL/key correctas (sin espacios ni comillas de más).
+- **Error "Invalid path specified in request URL"**: la `SUPABASE_URL` de `env.js` tiene un path de más (ej. copiaste `.../rest/v1/`). Tiene que ser SOLO la base: `https://TUPROYECTO.supabase.co` — sin nada después del `.co`.
 - **La app carga pero no muestra datos**: casi seguro corriste el seed antes de crear el usuario, o creaste un segundo usuario antes que el tuyo (el seed toma el PRIMER usuario creado). Verificá en Table Editor que las filas de `nutricion_alimentos` tengan tu `user_id`.
 - **Error al correr un SQL**: corrélos en orden (00 → 01 → 02). Se pueden re-correr sin miedo, son idempotentes.
