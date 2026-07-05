@@ -1,0 +1,10 @@
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Dependencias (no usamos npm, pero por las dudas)
+node_modules/
+
+# Logs
+*.log

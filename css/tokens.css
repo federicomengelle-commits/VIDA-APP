@@ -1,0 +1,58 @@
+/* ============================================================
+   VIDA · tokens de identidad
+   Dark minimalista premium. Acento turquesa-verde (salud) +
+   azul (confianza). Cambiar la identidad = tocar SOLO este archivo.
+   Tipografía: Sora (display) · Manrope (UI) · Spline Sans Mono (números).
+   ============================================================ */
+
+:root {
+  /* Fondos — casi negros con tinte verde, jerarquía por sutileza */
+  --bg:            #080b0a;
+  --surface:       #0e1412;
+  --surface-2:     #151d1a;
+  --border:        #1e2925;
+  --border-strong: #2e3c36;
+
+  /* Texto */
+  --text:       #e7efec;
+  --text-dim:   #93a8a0;
+  --text-faint: #5b6d66;
+
+  /* Acentos */
+  --accent:        #35e0b2;                      /* turquesa-verde salud */
+  --accent-soft:   rgba(53, 224, 178, 0.13);
+  --accent-2:      #5aa2ff;                      /* azul confianza */
+  --accent-2-soft: rgba(90, 162, 255, 0.13);
+
+  /* Semánticos */
+  --ok:     #43d17c;
+  --warn:   #e8b64c;
+  --danger: #f26d6d;
+
+  /* Tipografía */
+  --font-ui:      'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-display: 'Sora', 'Manrope', system-ui, sans-serif;
+  --font-num:     'Spline Sans Mono', ui-monospace, 'Cascadia Mono', monospace; /* tabular por diseño */
+
+  /* Radios */
+  --radius-sm: 6px;
+  --radius:    10px;
+  --radius-lg: 16px;
+
+  /* Espaciado — escala 4px */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 28px;
+  --space-8: 32px;
+
+  /* Sombras */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.45), 0 2px 10px rgba(0, 0, 0, 0.25);
+  --shadow-2: 0 4px 14px rgba(0, 0, 0, 0.5), 0 14px 36px rgba(0, 0, 0, 0.35);
+
+  /* Layout */
+  --sidebar-w: 232px;
+}
