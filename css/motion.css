@@ -1,0 +1,65 @@
+/* ============================================================
+   VIDA · motion — utilidades de movimiento reutilizables
+   Todo con transform/opacity (60fps). Respeta prefers-reduced-motion.
+   Consumido por anim.js, home.js y los módulos rediseñados.
+   Nada de esto pisa las primitivas de base.css: son clases nuevas.
+   ============================================================ */
+
+/* ---------- Entrada escalonada: nace abajo y sube (anim.js agrega .in) ---------- */
+.rise { opacity: 0; transform: translateY(16px); }
+.rise.in {
+  opacity: 1;
+  transform: none;
+  transition: opacity var(--dur-slow) var(--ease-out-expo),
+              transform var(--dur-slow) var(--ease-out-expo);
+}
+
+/* ---------- Respiración de glows ambientales ---------- */
+@keyframes vida-breathe {
+  0%, 100% { transform: scale(1);    opacity: 0.75; }
+  50%      { transform: scale(1.12); opacity: 1; }
+}
+.breathe { animation: vida-breathe 5s ease-in-out infinite; }
+
+/* ---------- Latido (Pulso VIDA, indicadores vivos) ---------- */
+@keyframes vida-heart {
+  0%, 100% { transform: scale(1);   opacity: 0.9; }
+  50%      { transform: scale(1.5); opacity: 1; }
+}
+.heartbeat { animation: vida-heart 2.4s ease-in-out infinite; }
+
+/* ---------- Shimmer de carga (skeletons) ---------- */
+@keyframes vida-shimmer { 100% { background-position: 200% 0; } }
+.shimmer {
+  background: linear-gradient(100deg, var(--surface) 30%, var(--surface-2) 50%, var(--surface) 70%);
+  background-size: 200% 100%;
+  animation: vida-shimmer 1.3s linear infinite;
+  color: transparent !important;
+  border-radius: var(--radius-sm);
+}
+
+/* ---------- Anillo SVG: track + fill (anim.js anima stroke-dashoffset) ---------- */
+.v-ring-track { fill: none; stroke: var(--border-strong); }
+.v-ring-fill  {
+  fill: none;
+  stroke: var(--accent);
+  stroke-linecap: round;
+  transition: stroke-dashoffset var(--dur-slow) var(--ease-out-expo);
+}
+
+/* ---------- Card viva: lift + glow al hover, press al activar (opt-in .lively) ---------- */
+.lively {
+  transition: transform var(--dur) var(--ease-out-expo),
+              box-shadow var(--dur) ease,
+              border-color var(--dur) ease;
+}
+.lively:hover  { transform: translateY(-3px); box-shadow: var(--shadow-2); }
+.lively:active { transform: translateY(0); }
+
+/* ---------- Respeto por el que mira ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .rise { opacity: 1 !important; transform: none !important; transition: none !important; }
+  .breathe, .heartbeat, .shimmer { animation: none !important; }
+  .v-ring-fill { transition: none !important; }
+  .lively:hover { transform: none; }
+}

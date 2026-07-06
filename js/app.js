@@ -7,6 +7,7 @@ import { toast, confirmDialog } from './core/ui.js';
 import { initCaptura } from './core/captura.js';
 
 const MODULES = [
+  { id: 'home',      label: 'Inicio',    icon: '🏠', enabled: true,  loader: () => import('./modules/home.js') },
   { id: 'nutricion', label: 'Nutrición', icon: '🥩', enabled: true,  loader: () => import('./modules/nutricion.js') },
   { id: 'plata',     label: 'Plata',     icon: '💵', enabled: true,  loader: () => import('./modules/plata.js') },
   { id: 'rutina',    label: 'Rutina',    icon: '☀️', enabled: true,  loader: () => import('./modules/rutina.js') },
@@ -232,7 +233,7 @@ async function enterApp(user) {
       return;
     }
 
-    await startRouter('nutricion');
+    await startRouter('home');
     initCaptura(); // captador universal (voz + texto); idempotente
   } catch (err) {
     console.error('[app] enterApp falló:', err);
