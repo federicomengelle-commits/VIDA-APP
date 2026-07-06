@@ -2,6 +2,7 @@
 
 > Documento raíz del proyecto. Claude Code lo lee UNA vez y respeta en todo.
 > Estado: v1. Se itera. Profundo y ejecutable en Arquitectura + Módulo Nutrición; roadmap en el resto.
+> **Rediseño + visión de producto ampliada:** ver [docs/REDISENO.md](docs/REDISENO.md) (piel "Instrumento vivo" + movimiento) y [docs/BACKLOG.md](docs/BACKLOG.md) (backlog completo + catálogo de palancas). Se construye en 3 olas; se arranca por la Ola 1 (Home cockpit + palancas + captura + Nutrición).
 
 ---
 

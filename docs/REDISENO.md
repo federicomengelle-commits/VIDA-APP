@@ -2,6 +2,7 @@
 
 > Norte visual y plan de ejecución del rediseño superador de toda la app.
 > Complementa CLAUDE.md (no lo reemplaza). La arquitectura no cambia; cambia la piel y el movimiento.
+> El catálogo de funcionalidades e interconexiones (el QUÉ) vive en [BACKLOG.md](BACKLOG.md); este doc es el CÓMO se ve y se mueve.
 
 ## Decisiones tomadas
 
@@ -31,8 +32,8 @@
 |---|---|---|
 | **D0** | Norte visual | Prototipo navegable del Home (Artifact) para validar la dirección — **hecho** |
 | **D1** | Motor de diseño + movimiento | tokens ampliados + `motion.css` + `anim.js` + primitivas elevadas |
-| **D2** | El faro | `home.js` (tablero de núcleos + palancas) como landing post-login + Nutrición rediseñada |
-| **D3** | Propagación | El lenguaje aplicado a Plata, Rutina, Training, Insights (uno por uno, verificando) |
+| **D2** | El faro (Ola 1) | `home.js`: **Home cockpit** con **Pulso VIDA** (latido central) + anillos del día + palancas cruzadas + **captura por voz viva** (FAB), como landing post-login. + Nutrición rediseñada |
+| **D3** | Propagación (Ola 2) | Lenguaje + funcionalidades nuevas por módulo: Plata Panorama, Training (timer/volumen/plantillas), Rutina (momentos/inventario↔Plata), Cuerpo (hidratación/peso). Detalle en [BACKLOG.md](BACKLOG.md) |
 | **D4** | Shell + transiciones globales | Sidenav con indicador deslizante, transición entre módulos, bottom-nav con física, boot animado |
 | **D5** | QA de gusto | Performance 60fps, reduced-motion, mobile real, accesibilidad |
 
