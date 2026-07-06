@@ -28,6 +28,13 @@ function esc(s) {
 }
 function msgErr(err) { return (err && err.message) ? err.message : 'error de conexión'; }
 
+// Respeto por prefers-reduced-motion — se lee en vivo (no cachea) para
+// reaccionar si el usuario cambia la preferencia del SO en caliente.
+// Espeja el criterio de core/anim.js pero sin importarlo (mandato: 1 archivo).
+function reducedMotion() {
+  return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+}
+
 // Normaliza para matchear: minúsculas, sin acentos/diacríticos, espacios simples.
 function norm(s) {
   return String(s == null ? '' : s)
@@ -615,7 +622,68 @@ const O = {
   texto: '',
   propuesta: null,     // resultado de interpretar() (editable)
   guardando: false,    // guard anti doble-tap del commit
+  interpretando: false,// true mientras corre interpretar() (FAB "pensando")
+  ultimoInsert: null,  // { tabla, ids:[], soft, label, modulo } para deshacer
 };
+
+/* ---- Estado vivo del FAB: 'idle' | 'grabando' | 'pensando' -------------- */
+// El FAB es el latido de la captura (CLAUDE.md §0). Un solo data-attr manda
+// la animación (CSS puro); el nivel del micro (opcional) modula --cap-level.
+function setFabEstado(estado) {
+  if (!O.fab) return;
+  O.fab.dataset.capEstado = estado;
+}
+
+/* ---- Medidor de nivel de micrófono (Web Audio, opcional y degradable) ---
+   Alimenta la variable CSS --cap-level (0..1) para que el anillo de "grabando"
+   reaccione a la voz. Si el navegador no da getUserMedia/AudioContext, no pasa
+   nada: la animación de pulso por CSS ya cubre el caso sin medidor. */
+const MIC = { ctx: null, stream: null, analyser: null, raf: 0, data: null };
+
+async function iniciarMedidorMic() {
+  if (reducedMotion()) return;               // sin animaciones → sin medición
+  if (MIC.ctx) return;                       // ya activo
+  try {
+    const nav = window.navigator;
+    if (!nav || !nav.mediaDevices || !nav.mediaDevices.getUserMedia) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const stream = await nav.mediaDevices.getUserMedia({ audio: true });
+    // Si el usuario ya cerró/paró mientras pedíamos permiso, soltar y salir.
+    if (!O.reconociendo) { stream.getTracks().forEach(t => t.stop()); return; }
+    const ctx = new AC();
+    const src = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.75;
+    src.connect(analyser);
+    MIC.ctx = ctx; MIC.stream = stream; MIC.analyser = analyser;
+    MIC.data = new Uint8Array(analyser.frequencyBinCount);
+    const tick = () => {
+      if (!MIC.analyser) return;
+      MIC.analyser.getByteFrequencyData(MIC.data);
+      let suma = 0;
+      for (let i = 0; i < MIC.data.length; i++) suma += MIC.data[i];
+      const prom = suma / MIC.data.length / 255;             // 0..1 crudo
+      const nivel = Math.min(1, Math.max(0, prom * 2.2));     // realza voz baja
+      if (O.fab) O.fab.style.setProperty('--cap-level', nivel.toFixed(3));
+      MIC.raf = requestAnimationFrame(tick);
+    };
+    MIC.raf = requestAnimationFrame(tick);
+  } catch (_) {
+    // Permiso denegado o API ausente: el pulso CSS alcanza. No romper.
+    detenerMedidorMic();
+  }
+}
+
+function detenerMedidorMic() {
+  if (MIC.raf) cancelAnimationFrame(MIC.raf);
+  MIC.raf = 0;
+  if (MIC.stream) { try { MIC.stream.getTracks().forEach(t => t.stop()); } catch (_) {} }
+  if (MIC.ctx) { try { MIC.ctx.close(); } catch (_) {} }
+  MIC.ctx = null; MIC.stream = null; MIC.analyser = null; MIC.data = null;
+  if (O.fab) O.fab.style.setProperty('--cap-level', '0');
+}
 
 /* ---- Web Speech API (STT) ---- */
 function getSpeechRecognition() {
@@ -640,6 +708,8 @@ function iniciarSTT() {
     };
     rec.onerror = (ev) => {
       O.reconociendo = false;
+      detenerMedidorMic();
+      setFabEstado('idle');
       pintarOverlay();
       const err = ev && ev.error;
       if (err === 'not-allowed' || err === 'service-not-allowed') {
@@ -651,7 +721,13 @@ function iniciarSTT() {
         toast('Idioma de voz no soportado; escribí el texto.', 'warning');
       }
     };
-    rec.onend = () => { O.reconociendo = false; pintarOverlay(); };
+    rec.onend = () => {
+      O.reconociendo = false;
+      detenerMedidorMic();
+      // Si el overlay sigue abierto, el FAB vuelve a respirar (idle).
+      if (O.abierto) setFabEstado('idle');
+      pintarOverlay();
+    };
     O.recognition = rec;
     O.sttDisponible = true;
   } catch (err) {
@@ -664,16 +740,22 @@ function toggleGrabar() {
   if (O.reconociendo) {
     try { O.recognition.stop(); } catch (_) {}
     O.reconociendo = false;
+    detenerMedidorMic();
+    setFabEstado('idle');
     pintarOverlay();
     return;
   }
   try {
     O.recognition.start();
     O.reconociendo = true;
+    setFabEstado('grabando');
+    iniciarMedidorMic();   // async; degrada solo si no hay permiso/API
     pintarOverlay();
   } catch (err) {
     // start() tira si ya está corriendo; lo dejamos consistente.
     O.reconociendo = false;
+    detenerMedidorMic();
+    setFabEstado('idle');
     pintarOverlay();
   }
 }
@@ -686,7 +768,9 @@ function abrir() {
   O.texto = '';
   O.propuesta = null;
   O.guardando = false;
+  O.interpretando = false;
   origenUltimo = 'texto'; // por defecto; pasa a 'voz' si se usa el micrófono
+  setFabEstado('idle');
   cargarCatalogos(); // pre-cachea para que "Entender" sea instantáneo
   pintarOverlay();
   requestAnimationFrame(() => {
@@ -698,6 +782,9 @@ function abrir() {
 function cerrar() {
   if (O.reconociendo && O.recognition) { try { O.recognition.stop(); } catch (_) {} }
   O.reconociendo = false;
+  O.interpretando = false;
+  detenerMedidorMic();
+  setFabEstado('idle');
   O.abierto = false;
   O.propuesta = null;
   O.texto = '';
@@ -710,12 +797,21 @@ async function entender() {
   const txt = ta ? ta.value : O.texto;
   O.texto = txt;
   if (!String(txt || '').trim()) { toast('Escribí o dictá algo primero', 'warning'); return; }
+  // Detener dictado si seguía activo y pasar el FAB a "pensando" (shimmer).
+  if (O.reconociendo && O.recognition) { try { O.recognition.stop(); } catch (_) {} }
+  O.reconociendo = false;
+  detenerMedidorMic();
+  O.interpretando = true;
+  setFabEstado('pensando');
+  pintarOverlay(); // muestra el botón "Entender" en estado ocupado
   try {
     O.propuesta = await interpretar(txt);
   } catch (err) {
     O.propuesta = { modulo: null, crudo: String(txt).trim() };
     toast('No se pudo interpretar: ' + msgErr(err), 'error');
   }
+  O.interpretando = false;
+  setFabEstado('idle');
   pintarOverlay();
 }
 
@@ -748,9 +844,11 @@ function vistaEntrada() {
 
     <textarea id="capTexto" class="cap-textarea" rows="3"
       placeholder="Ej: gasté 5 lucas en el súper · almorcé 250 de carne · tomé la creatina · press banca 4x10 con 80"
-      aria-label="Texto a interpretar">${esc(O.texto)}</textarea>
+      aria-label="Texto a interpretar"${O.interpretando ? ' disabled' : ''}>${esc(O.texto)}</textarea>
 
-    <button class="cap-btn-primario" data-cap="entender">Entender</button>
+    <button class="cap-btn-primario${O.interpretando ? ' cap-pensando' : ''}" data-cap="entender"${O.interpretando ? ' disabled' : ''}>
+      <span class="cap-btn-lbl">${O.interpretando ? 'Interpretando…' : 'Entender'}</span>
+    </button>
     <p class="cap-hint">Siempre vas a poder revisar y editar antes de guardar.</p>
   </div>`;
 }
@@ -1007,8 +1105,16 @@ async function commit() {
 
     if (etiqueta === null) { O.guardando = false; return; } // validación falló (ya avisó)
 
-    toastAnotado(etiqueta.label, etiqueta.modulo);
-    cerrar();
+    // Guardar referencia para "Deshacer" solo si hay ids reales que revertir.
+    O.ultimoInsert = (etiqueta.undo && etiqueta.undo.ids && etiqueta.undo.ids.length)
+      ? { ...etiqueta.undo, label: etiqueta.label, modulo: etiqueta.modulo, sello: Date.now() }
+      : null;
+
+    // La card "vuela" al ícono del módulo destino y ese ícono pega un pulso.
+    // volarCardAlModulo cierra el overlay (con o sin animación) al terminar.
+    volarCardAlModulo(etiqueta.modulo, () => {
+      toastAnotado(etiqueta.label, etiqueta.modulo);
+    });
   } catch (err) {
     toast('No se pudo guardar: ' + msgErr(err), 'error');
   }
@@ -1017,22 +1123,165 @@ async function commit() {
 
 const MOD_LABEL = { plata: 'Plata', nutricion: 'Nutrición', training: 'Training', rutina: 'Rutina' };
 
-// Toast "Anotado en X" con acción "Ver" que navega al módulo.
+// Toast "Anotado en X" con acciones "Deshacer" (revierte el insert) y "Ver"
+// (navega al módulo). Ventana de deshacer ~6s. El core toast() no soporta
+// botones de acción → montamos un toast propio con las dos acciones.
 function toastAnotado(detalle, modulo) {
   toast('Anotado en ' + (MOD_LABEL[modulo] || modulo) + (detalle ? ': ' + detalle : ''), 'success');
-  // Acción "Ver": toast() del core no soporta botón de acción, así que
-  // exponemos la navegación por un toast clickeable adicional.
+
   const wrap = document.getElementById('vidaToasts');
   if (!wrap) return;
+
+  const puedeDeshacer = !!(O.ultimoInsert && O.ultimoInsert.ids && O.ultimoInsert.ids.length);
+  const selloEsperado = puedeDeshacer ? O.ultimoInsert.sello : null;
+
   const el = document.createElement('div');
-  el.className = 'vida-toast vida-toast-info cap-toast-ver';
+  el.className = 'vida-toast vida-toast-info cap-toast-acc';
   el.setAttribute('role', 'status');
-  el.innerHTML = `<span class="vida-toast-ic">→</span><span class="vida-toast-msg">Ver ${esc(MOD_LABEL[modulo] || modulo)}</span>`;
+  el.innerHTML = `
+    ${puedeDeshacer ? `<button type="button" class="cap-toast-btn cap-toast-undo" data-cap-toast="undo">↩ Deshacer</button>` : ''}
+    <button type="button" class="cap-toast-btn cap-toast-ver" data-cap-toast="ver"><span class="cap-toast-arrow">→</span> Ver ${esc(MOD_LABEL[modulo] || modulo)}</button>`;
   wrap.appendChild(el);
   requestAnimationFrame(() => el.classList.add('in'));
-  const quitar = () => { el.classList.remove('in'); setTimeout(() => el.remove(), 400); };
-  el.addEventListener('click', () => { navigate(modulo); quitar(); });
-  setTimeout(quitar, 5000);
+
+  let cerrado = false;
+  const quitar = () => {
+    if (cerrado) return;
+    cerrado = true;
+    el.classList.remove('in');
+    setTimeout(() => el.remove(), 400);
+  };
+
+  el.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-cap-toast]');
+    if (!btn) return;
+    const accion = btn.dataset.capToast;
+    if (accion === 'ver') { navigate(modulo); quitar(); return; }
+    if (accion === 'undo') {
+      // Solo deshace si el "último insert" sigue siendo ESTE (no lo pisó otra captura).
+      if (!O.ultimoInsert || O.ultimoInsert.sello !== selloEsperado) { quitar(); return; }
+      btn.disabled = true;
+      await deshacerUltimo(O.ultimoInsert, modulo);
+      quitar();
+    }
+  });
+
+  // Ventana de deshacer ~6s (un poco más larga que un toast normal, para dar tiempo).
+  setTimeout(quitar, 6000);
+}
+
+/* ============================================================
+   Deshacer — revierte el insert recién hecho.
+   Soft-delete (_deleted=true) donde el esquema lo soporta (plata);
+   hard delete donde no (nutricion_log / training_sets / rutina_checks).
+   ============================================================ */
+async function deshacerUltimo(ref, modulo) {
+  if (!supabase) { toast('Supabase no está configurado', 'error'); return; }
+  const uid = getUserId();
+  if (!uid) { toast('No hay sesión activa', 'error'); return; }
+  const { tabla, ids, soft } = ref || {};
+  if (!tabla || !Array.isArray(ids) || !ids.length) return;
+  try {
+    let error;
+    if (soft) {
+      ({ error } = await supabase.from(tabla).update({ _deleted: true }).in('id', ids).eq('user_id', uid));
+    } else {
+      ({ error } = await supabase.from(tabla).delete().in('id', ids).eq('user_id', uid));
+    }
+    if (error) throw error;
+    // Consumido: no permitir deshacer dos veces el mismo insert.
+    if (O.ultimoInsert && O.ultimoInsert.sello === ref.sello) O.ultimoInsert = null;
+    toast('Deshecho · se quitó de ' + (MOD_LABEL[modulo] || modulo), 'info');
+  } catch (err) {
+    toast('No se pudo deshacer: ' + msgErr(err), 'error');
+  }
+}
+
+/* ============================================================
+   Card "vuela" al módulo destino (FLIP con getBoundingClientRect).
+   Clona la card, la encoge y desliza hacia el ícono de la nav del módulo;
+   ese ícono pega un pulso de "recibido". Sin ícono / reduced-motion →
+   fade normal. Siempre cierra el overlay al terminar (onDone corre antes
+   del cierre visual para que el toast aparezca en tiempo).
+   ============================================================ */
+
+// Ícono de la nav del módulo que esté VISIBLE (desktop .vida-nav o mobile
+// .vida-dock; el otro está display:none). Devuelve el elemento o null.
+function iconoNavModulo(modulo) {
+  const nodos = document.querySelectorAll(`.vida-nav-item[data-id="${modulo}"]`);
+  for (const el of nodos) {
+    const r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) return el; // visible (el oculto mide 0)
+  }
+  return null;
+}
+
+// Pulso "recibido" en el ícono destino (glow + rebote breve).
+function pulsarIcono(el) {
+  if (!el || reducedMotion()) return;
+  el.classList.remove('cap-nav-recibido');
+  // reflow para reiniciar la animación si ya la tenía
+  void el.offsetWidth;
+  el.classList.add('cap-nav-recibido');
+  setTimeout(() => el.classList.remove('cap-nav-recibido'), 700);
+}
+
+function volarCardAlModulo(modulo, onDone) {
+  const card = O.overlay && O.overlay.querySelector('.cap-card');
+  const destino = iconoNavModulo(modulo);
+
+  // Degradación: sin animación posible → toast + cierre directo.
+  if (!card || !destino || reducedMotion()) {
+    if (onDone) onDone();
+    pulsarIcono(destino); // no-op si reduced-motion o sin destino
+    cerrar();
+    return;
+  }
+
+  const desde = card.getBoundingClientRect();
+  const hasta = destino.getBoundingClientRect();
+
+  // Clon volador: copia el look de la card, posicionado fixed sobre ella.
+  const vol = document.createElement('div');
+  vol.className = 'cap-volador';
+  vol.style.left = desde.left + 'px';
+  vol.style.top = desde.top + 'px';
+  vol.style.width = desde.width + 'px';
+  vol.style.height = desde.height + 'px';
+  document.body.appendChild(vol);
+
+  // Ocultar la card real y el fondo del modal ya (el clon toma la posta).
+  // pointer-events:none evita un re-tap sobre el modal invisible durante el vuelo.
+  const modal = O.overlay.querySelector('.cap-modal');
+  if (modal) { modal.style.opacity = '0'; modal.style.pointerEvents = 'none'; }
+
+  // Delta hacia el centro del ícono destino + escala mínima.
+  const cx = hasta.left + hasta.width / 2;
+  const cy = hasta.top + hasta.height / 2;
+  const dx = cx - (desde.left + desde.width / 2);
+  const dy = cy - (desde.top + desde.height / 2);
+  const escala = Math.max(0.05, Math.min(0.22, (hasta.width || 40) / (desde.width || 320)));
+
+  // Toast/estado ahora (antes de que el clon termine) para que aparezca a tiempo.
+  if (onDone) onDone();
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      vol.style.transform = `translate(${dx}px, ${dy}px) scale(${escala})`;
+      vol.style.opacity = '0.15';
+    });
+  });
+
+  let terminado = false;
+  const finalizar = () => {
+    if (terminado) return;
+    terminado = true;
+    vol.remove();
+    pulsarIcono(destino);
+    cerrar();
+  };
+  vol.addEventListener('transitionend', finalizar, { once: true });
+  setTimeout(finalizar, 620); // fallback si no dispara transitionend
 }
 
 async function commitPlata(uid, p) {
@@ -1053,9 +1302,14 @@ async function commitPlata(uid, p) {
     origen: origenActual(),
     crudo: p.crudo,
   };
-  const { error } = await supabase.from('plata_movimientos').insert(fila);
+  const { data, error } = await supabase.from('plata_movimientos').insert(fila).select('id');
   if (error) throw error;
-  return { modulo: 'plata', label: (fila.tipo === 'ingreso' ? '+' : '−') + ' ' + monto + ' ' + fila.moneda };
+  const ids = (data || []).map(r => r.id).filter(Boolean);
+  return {
+    modulo: 'plata',
+    label: (fila.tipo === 'ingreso' ? '+' : '−') + ' ' + monto + ' ' + fila.moneda,
+    undo: { tabla: 'plata_movimientos', ids, soft: true },
+  };
 }
 
 async function commitNutricion(uid, p) {
@@ -1076,10 +1330,15 @@ async function commitNutricion(uid, p) {
     grasa: num(it.grasa),
     kcal: num(it.kcal),
   }));
-  const { error } = await supabase.from('nutricion_log').insert(filas);
+  const { data, error } = await supabase.from('nutricion_log').insert(filas).select('id');
   if (error) throw error;
+  const ids = (data || []).map(r => r.id).filter(Boolean);
   const totalProt = filas.reduce((s, f) => s + f.prot, 0);
-  return { modulo: 'nutricion', label: filas.length + ' ítem' + (filas.length > 1 ? 's' : '') + ' · ' + Math.round(totalProt) + ' g prot' };
+  return {
+    modulo: 'nutricion',
+    label: filas.length + ' ítem' + (filas.length > 1 ? 's' : '') + ' · ' + Math.round(totalProt) + ' g prot',
+    undo: { tabla: 'nutricion_log', ids, soft: false },
+  };
 }
 
 async function commitTraining(uid, p) {
@@ -1132,9 +1391,16 @@ async function commitTraining(uid, p) {
     reps: Math.round(Number(s.reps) || 0),
     completado: true,
   }));
-  const { error: e3 } = await supabase.from('training_sets').insert(filas);
+  const { data: setsIns, error: e3 } = await supabase.from('training_sets').insert(filas).select('id');
   if (e3) throw e3;
-  return { modulo: 'training', label: nombre + ' · ' + filas.length + ' serie' + (filas.length > 1 ? 's' : '') };
+  const ids = (setsIns || []).map(r => r.id).filter(Boolean);
+  // Undo revierte los SETS recién insertados (el registro capturado). La sesión
+  // y el ejercicio del catálogo quedan; borrar solo los sets es el revert seguro.
+  return {
+    modulo: 'training',
+    label: nombre + ' · ' + filas.length + ' serie' + (filas.length > 1 ? 's' : ''),
+    undo: { tabla: 'training_sets', ids, soft: false },
+  };
 }
 
 async function commitRutina(uid, p) {
@@ -1143,21 +1409,27 @@ async function commitRutina(uid, p) {
   if (!checks.length) { toast('No hay hábitos marcados', 'warning'); return null; }
   const fecha = String(c.fecha || hoyStr()).slice(0, 10) || hoyStr();
   let ok = 0, yaHechos = 0;
+  const idsNuevos = []; // solo los checks RECIÉN insertados (deshacer no toca los que ya estaban)
   for (const ch of checks) {
-    const { error } = await supabase.from('rutina_checks').insert({
+    const { data, error } = await supabase.from('rutina_checks').insert({
       user_id: uid, fecha, rutina_id: ch.rutina_id, item_id: String(ch.item_id),
-    });
+    }).select('id');
     if (error) {
       // 23505 = violación de unique → ya estaba hecho ese día. No es error.
       if (error.code === '23505' || /duplicate key|unique/i.test(error.message || '')) { yaHechos++; continue; }
       throw error;
     }
+    if (data && data[0] && data[0].id) idsNuevos.push(data[0].id);
     ok++;
   }
   const partes = [];
   if (ok) partes.push(ok + ' marcado' + (ok > 1 ? 's' : ''));
   if (yaHechos) partes.push(yaHechos + ' ya estaba' + (yaHechos > 1 ? 'n' : ''));
-  return { modulo: 'rutina', label: partes.join(' · ') || 'sin cambios' };
+  return {
+    modulo: 'rutina',
+    label: partes.join(' · ') || 'sin cambios',
+    undo: { tabla: 'rutina_checks', ids: idsNuevos, soft: false },
+  };
 }
 
 // origen: 'voz' si la última captura vino del dictado, 'texto' si se tipeó.
@@ -1246,6 +1518,7 @@ function onKeydown(e) {
    ============================================================ */
 const CSS = `
 .cap-fab {
+  --cap-level: 0;                         /* nivel del micro (0..1), lo setea el medidor */
   position: fixed; z-index: 45;
   right: calc(var(--space-4) + env(safe-area-inset-right, 0px));
   bottom: calc(var(--space-6) + env(safe-area-inset-bottom, 0px));
@@ -1259,6 +1532,62 @@ const CSS = `
 .cap-fab:hover { filter: brightness(1.08); }
 .cap-fab:active { transform: scale(.94); }
 .cap-fab:focus-visible { outline: 3px solid var(--accent-2); outline-offset: 3px; }
+
+/* El FAB emite dos capas vivas (::before halo/anillo, ::after onda). El icono
+   queda por encima (position + z-index sobre los pseudo-elementos). */
+.cap-fab > * { position: relative; z-index: 2; }
+.cap-fab::before, .cap-fab::after {
+  content: ""; position: absolute; inset: 0; border-radius: 50%;
+  pointer-events: none; z-index: 1;
+}
+
+/* --- IDLE: halo turquesa que respira alrededor del FAB --- */
+.cap-fab[data-cap-estado="idle"]::before {
+  background: radial-gradient(circle, var(--accent-soft) 0%, transparent 70%);
+  transform: scale(1.35);
+  animation: cap-halo 4.5s ease-in-out infinite;
+}
+@keyframes cap-halo {
+  0%, 100% { transform: scale(1.2);  opacity: .55; }
+  50%      { transform: scale(1.7);  opacity: 1; }
+}
+
+/* --- GRABANDO: anillo que late; su intensidad sube con la voz (--cap-level) --- */
+.cap-fab[data-cap-estado="grabando"] {
+  animation: cap-fab-latido 1.6s ease-in-out infinite;
+}
+.cap-fab[data-cap-estado="grabando"]::before {
+  border: 2px solid var(--accent);
+  opacity: calc(.35 + var(--cap-level) * .55);
+  transform: scale(calc(1.15 + var(--cap-level) * .55));
+  transition: transform .08s linear, opacity .08s linear;
+}
+.cap-fab[data-cap-estado="grabando"]::after {
+  border: 2px solid var(--accent);
+  animation: cap-onda 1.5s ease-out infinite;
+}
+@keyframes cap-onda {
+  0%   { transform: scale(1);   opacity: .5; }
+  100% { transform: scale(2.1); opacity: 0; }
+}
+@keyframes cap-fab-latido {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.06); }
+}
+
+/* --- PENSANDO: shimmer que barre el FAB mientras interpreta --- */
+.cap-fab[data-cap-estado="pensando"] {
+  background-image: linear-gradient(100deg, var(--accent) 30%, var(--accent-2) 50%, var(--accent) 70%);
+  background-size: 220% 100%;
+  animation: cap-shimmer-fab 1.1s linear infinite;
+}
+.cap-fab[data-cap-estado="pensando"]::before {
+  border: 2px dashed color-mix(in srgb, var(--accent-2) 70%, transparent);
+  transform: scale(1.3);
+  animation: cap-girar 2.4s linear infinite;
+}
+@keyframes cap-shimmer-fab { 100% { background-position: 220% 0; } }
+@keyframes cap-girar { 100% { transform: scale(1.3) rotate(360deg); } }
 
 /* Mobile: la bottom-nav ocupa ~88px abajo → subir el FAB por encima. */
 @media (max-width: 767px) {
@@ -1320,6 +1649,13 @@ const CSS = `
 .cap-btn-primario:hover { filter: brightness(1.1); }
 .cap-btn-primario:active { transform: translateY(1px); }
 .cap-btn-primario:disabled { opacity: .45; cursor: default; }
+/* "Entender" ocupado mientras interpreta: shimmer sutil sobre el acento. */
+.cap-btn-primario.cap-pensando {
+  opacity: 1;
+  background-image: linear-gradient(100deg, var(--accent) 30%, var(--accent-2) 50%, var(--accent) 70%);
+  background-size: 220% 100%;
+  animation: cap-shimmer-fab 1.1s linear infinite;
+}
 .cap-btn-sec { min-height: 42px; padding: var(--space-1) var(--space-4); background: transparent; border: 1px solid var(--border-strong); border-radius: var(--radius); color: var(--text-dim); font: inherit; font-weight: 600; cursor: pointer; }
 .cap-btn-sec:hover { background: var(--surface-2); color: var(--text); }
 .cap-btn-ghost { min-height: 44px; padding: var(--space-1) var(--space-4); background: transparent; border: none; color: var(--text-faint); font: inherit; font-weight: 600; cursor: pointer; border-radius: var(--radius); }
@@ -1357,11 +1693,64 @@ select.cap-input { appearance: none; -webkit-appearance: none; }
 .cap-acciones { display: flex; gap: var(--space-2); margin-top: var(--space-2); }
 .cap-acciones .cap-btn-primario { flex: 1; }
 
-.cap-toast-ver { cursor: pointer; border-color: var(--accent) !important; }
+/* --- Toast de acciones tras guardar: Deshacer + Ver --- */
+.cap-toast-acc {
+  display: flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-1) var(--space-2) !important;
+  cursor: default; border-color: var(--accent) !important;
+}
+.cap-toast-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 7px 12px; border-radius: var(--radius-sm);
+  background: transparent; border: 1px solid var(--border-strong);
+  color: var(--text); font: inherit; font-size: .82rem; font-weight: 700;
+  cursor: pointer; white-space: nowrap;
+  transition: background var(--dur-fast, .12s) ease, border-color var(--dur-fast, .12s) ease, color var(--dur-fast, .12s) ease;
+}
+.cap-toast-btn:hover { background: var(--surface-2); }
+.cap-toast-undo { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
+.cap-toast-undo:hover { background: color-mix(in srgb, var(--warn) 14%, transparent); border-color: var(--warn); }
+.cap-toast-undo:disabled { opacity: .5; cursor: default; }
+.cap-toast-ver { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+.cap-toast-ver:hover { background: var(--accent-soft); border-color: var(--accent); }
+.cap-toast-arrow { font-weight: 800; }
+
+/* --- Clon volador de la card hacia el ícono del módulo --- */
+.cap-volador {
+  position: fixed; z-index: 80; pointer-events: none;
+  background: var(--surface); border: 1px solid var(--accent);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 0 0 1px var(--accent-soft), var(--shadow-2);
+  opacity: .95; transform-origin: center center; will-change: transform, opacity;
+  transition: transform 560ms var(--ease-spring, cubic-bezier(0.34,1.4,0.5,1)), opacity 560ms ease-in;
+}
+
+/* --- Pulso "recibido" en el ícono destino de la nav --- */
+.cap-nav-recibido { animation: cap-recibido 700ms var(--ease-out-expo, cubic-bezier(0.16,1,0.3,1)); }
+.cap-nav-recibido .vida-nav-ic { animation: cap-recibido-ic 700ms var(--ease-spring, cubic-bezier(0.34,1.4,0.5,1)); }
+@keyframes cap-recibido {
+  0%   { background: var(--accent-soft); box-shadow: 0 0 0 0 var(--accent-soft); }
+  40%  { background: var(--accent-soft); box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 22%, transparent); }
+  100% { background: transparent; box-shadow: 0 0 0 0 transparent; }
+}
+@keyframes cap-recibido-ic {
+  0%   { transform: scale(1); }
+  35%  { transform: scale(1.5); }
+  100% { transform: scale(1); }
+}
 
 @media (min-width: 768px) {
   .cap-modal { align-items: center; }
   .cap-card { border-radius: var(--radius-lg); }
+}
+
+/* --- Respeto por prefers-reduced-motion: nada de movimiento --- */
+@media (prefers-reduced-motion: reduce) {
+  .cap-fab { transition: none; animation: none !important; }
+  .cap-fab::before, .cap-fab::after { animation: none !important; opacity: 0 !important; }
+  .cap-btn-primario.cap-pensando { animation: none !important; background-image: none; }
+  .cap-volador { transition: none !important; }
+  .cap-nav-recibido, .cap-nav-recibido .vida-nav-ic { animation: none !important; }
 }
 `;
 
@@ -1388,10 +1777,15 @@ export function initCaptura() {
     fab.type = 'button';
     fab.setAttribute('aria-label', 'Captura rápida por voz o texto');
     fab.title = 'Capturá (voz o texto)';
-    fab.textContent = '🎤';
+    fab.dataset.capEstado = 'idle'; // arranca respirando (halo turquesa)
+    // El emoji va en un span para quedar por encima de los pseudo-elementos vivos.
+    fab.innerHTML = '<span class="cap-fab-ic" aria-hidden="true">🎤</span>';
     fab.addEventListener('click', abrir);
     document.body.appendChild(fab);
     O.fab = fab;
+  } else {
+    O.fab = document.getElementById('capFab');
+    if (O.fab && !O.fab.dataset.capEstado) O.fab.dataset.capEstado = 'idle';
   }
 
   // Overlay (guard anti-duplicado).

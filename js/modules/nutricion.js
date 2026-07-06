@@ -1,8 +1,16 @@
 // VIDA — Módulo Nutrición (Fase 1)
 // Log diario · Planificador semanal · Meal prep · Lista de compras
 // Contrato: docs/CONTRATOS.md §4 y §8. Spec funcional: CLAUDE.md §5.
+//
+// Piel "Instrumento Vivo" (rediseño): usa el motor de movimiento de core/anim.js
+// (countUp, ring, stagger, tiltAll) + clases de css/motion.css. La LÓGICA de datos
+// (queries, inserts/soft-delete, guards anti-carrera, config-driven) está intacta:
+// sólo se rediseñaron las funciones de render y se sumaron features determinísticas
+// robadas de Cal AI (anillo héroe de proteína, macros, escala de porción,
+// sparkline 7d, timer de ayuno en vivo). BACKLOG.md §2 y §7.
 import { supabase } from '../core/supabase.js';
 import { toast, confirmDialog } from '../core/ui.js';
+import { countUp, ring, stagger, tiltAll } from '../core/anim.js';
 
 /* ============================================================
    Fechas — helpers locales (YYYY-MM-DD local, semana desde LUNES)
@@ -63,10 +71,12 @@ const S = {
   diasTipo: [],            // plantillas de día (nutricion_dias_tipo)
   log: [],                 // nutricion_log del día visible
   plan: [],                // nutricion_plan de la semana visible
+  hist7: {},               // { 'YYYY-MM-DD': protTotal } últimos 7 días → sparkline
   cargando: false,
   mutandoPlan: false,      // in-flight guard de mutaciones del plan (doble tap)
   anotando: false,         // in-flight guard de inserts al log (doble tap)
-  picker: null,            // { slot, tab: 'favoritos'|'combos'|'alimentos'|'manual' }
+  picker: null,            // { slot, tab: 'favoritos'|'combos'|'alimentos'|'manual', escala, sel }
+  escala: 1,               // multiplicador de porción vigente en el picker (Cal AI)
   busca: '',
   comboPicker: null,       // { fecha, slot, tab: 'combos'|'alimentos' } → modal del planificador
   plantillaModal: null,    // { fecha } → modal de plantillas de día
@@ -139,6 +149,25 @@ async function cargarPlan() {
   return true;
 }
 
+// Sparkline (Cal AI §7): proteína total por día de los últimos 7 días.
+// Tolerante — si falla, deja S.hist7 como está y la feature simplemente no pinta.
+async function cargarHistoria7() {
+  const desde = addDias(hoyStr(), -6);
+  try {
+    const { data, error } = await supabase.from('nutricion_log')
+      .select('fecha, prot').eq('user_id', S.userId)
+      .gte('fecha', desde).lte('fecha', hoyStr());
+    if (error) throw error;
+    const acc = {};
+    for (const r of (data || [])) {
+      const f = String(r.fecha).slice(0, 10);
+      acc[f] = (acc[f] || 0) + (Number(r.prot) || 0);
+    }
+    S.hist7 = acc;
+    return true;
+  } catch (_) { return false; }
+}
+
 /* ============================================================
    Derivados
    ============================================================ */
@@ -154,6 +183,74 @@ function totalesDia() {
 }
 
 function entradasSlot(slotId) { return S.log.filter(e => e.slot === slotId); }
+
+// Serie de 7 días [{ fecha, prot, esHoy }] para el sparkline. El día visible
+// (S.fecha, casi siempre hoy) usa el total en vivo del log cargado; el resto
+// sale del snapshot S.hist7. Así la barra de hoy se mueve al tipear sin recargar.
+function serie7() {
+  const totHoy = totalesDia().prot;
+  const out = [];
+  for (let i = 6; i >= 0; i--) {
+    const f = addDias(hoyStr(), -i);
+    const prot = f === S.fecha ? totHoy : (Number(S.hist7[f]) || 0);
+    out.push({ fecha: f, prot, esHoy: f === hoyStr() });
+  }
+  return out;
+}
+
+// Escala los macros de un item por el multiplicador vigente del picker.
+// Devuelve una copia con nombre anotado (ej "Carne 250g ×1.5") si escala ≠ 1.
+function escalarItem(item, factor) {
+  const f = Number(factor) || 1;
+  if (f === 1) return { ...item };
+  const sufijo = f === 0.5 ? ' ×½' : f === 0.75 ? ' ×¾' : ' ×' + num(f);
+  return {
+    ...item,
+    nombre: item.nombre + sufijo,
+    prot: (Number(item.prot) || 0) * f,
+    carbo: (Number(item.carbo) || 0) * f,
+    grasa: (Number(item.grasa) || 0) * f,
+    kcal: (Number(item.kcal) || 0) * f,
+  };
+}
+
+// Ventana de ayuno en vivo (Cal AI §7 · BACKLOG §2): a partir de la config
+// ultima_comida → primera_comida, calcula estado ahora. Devuelve null si no hay
+// config válida. `pct` = avance del ayuno (0..100) para el arco.
+function estadoAyuno() {
+  const ay = cfgAyuno();
+  if (!ay || !ay.ultima_comida || !ay.primera_comida) return null;
+  const hm = (s) => { const [h, m] = String(s).split(':').map(Number); return (h || 0) * 60 + (m || 0); };
+  const ini = hm(ay.ultima_comida);   // arranca el ayuno (ej 21:00)
+  const fin = hm(ay.primera_comida);  // corta el ayuno (ej 14:00 del día siguiente)
+  const ahora = (() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); })();
+  // Duración total de la ventana (cruza medianoche si fin <= ini).
+  const total = (fin - ini + 1440) % 1440 || 1440;
+  // Minutos transcurridos desde el inicio del ayuno hasta ahora (mod 24h).
+  const trans = (ahora - ini + 1440) % 1440;
+  const ayunando = trans < total;
+  const fmtHM = (min) => {
+    const h = Math.floor(min / 60), m = Math.round(min % 60);
+    return h > 0 ? (m > 0 ? h + 'h ' + m + 'm' : h + 'h') : m + 'm';
+  };
+  if (ayunando) {
+    const falta = total - trans;
+    return {
+      ayunando: true, pct: Math.min(100, (trans / total) * 100),
+      texto: 'Ayunando hace ' + fmtHM(trans),
+      sub: falta > 0 ? 'faltan ' + fmtHM(falta) : 'ya podés comer',
+      ventana: ay.ultima_comida + ' → ' + ay.primera_comida,
+    };
+  }
+  // Ventana de comida abierta: cuánto falta para el próximo ayuno.
+  const haciaAyuno = (ini - ahora + 1440) % 1440;
+  return {
+    ayunando: false, pct: 0,
+    texto: 'Ventana de comida abierta',
+    sub: 'ayuno en ' + fmtHM(haciaAyuno),
+    ventana: ay.ultima_comida + ' → ' + ay.primera_comida,
+  };
+}
 
 function planDe(fecha, slot) {
   return S.plan.find(p => String(p.fecha).slice(0, 10) === fecha && p.slot === slot) || null;
@@ -299,20 +396,21 @@ async function agregarEntrada(slot, item) {
 function addAlimento(id) {
   const a = S.alimentos.find(x => x.id === id);
   if (!a || !S.picker) return;
-  return agregarEntrada(S.picker.slot, {
+  // Escala de porción (Cal AI): los macros se guardan ya escalados.
+  return agregarEntrada(S.picker.slot, escalarItem({
     tipo: 'alimento', id: a.id,
     nombre: a.porcion ? a.nombre + ' (' + a.porcion + ')' : a.nombre,
     prot: a.prot, carbo: a.carbo, grasa: a.grasa, kcal: a.kcal,
-  });
+  }, S.escala));
 }
 
 function addCombo(id) {
   const c = S.combos.find(x => x.id === id);
   if (!c || !S.picker) return;
-  return agregarEntrada(S.picker.slot, {
+  return agregarEntrada(S.picker.slot, escalarItem({
     tipo: 'combo', id: c.id, nombre: c.nombre,
     prot: c.prot, carbo: c.carbo, grasa: c.grasa, kcal: c.kcal,
-  });
+  }, S.escala));
 }
 
 async function borrarEntrada(id) {
@@ -613,9 +711,10 @@ function onClick(e) {
   if (a === 'dia-next') { cambiarDia(addDias(S.fecha, 1)); return; }
   if (a === 'dia-hoy') { cambiarDia(hoyStr()); return; }
 
-  if (a === 'abrir-picker') { S.picker = { slot: el.dataset.slot, tab: 'favoritos' }; S.busca = ''; paint(); return; }
+  if (a === 'abrir-picker') { S.picker = { slot: el.dataset.slot, tab: 'favoritos' }; S.busca = ''; S.escala = 1; paint(); return; }
   if (a === 'cerrar-picker') { S.picker = null; paint(); return; }
   if (a === 'picker-tab') { if (S.picker) { S.picker.tab = el.dataset.ptab; S.busca = ''; paint(); } return; }
+  if (a === 'escala') { S.escala = Number(el.dataset.f) || 1; paint(); return; }
 
   if (a === 'add-alimento') { addAlimento(el.dataset.id); return; }
   if (a === 'add-combo') { addCombo(el.dataset.id); return; }
@@ -712,7 +811,7 @@ function paint() {
   else vista = vistaHoy();
   S.container.innerHTML = `
   <div class="nut">
-    <header class="nut-head">
+    <header class="nut-head rise">
       <div class="nut-head-fila">
         <h2 class="nut-titulo">Nutrición</h2>
         ${chipAyuno()}
@@ -727,17 +826,44 @@ function paint() {
     ${S.comboPicker ? modalCombos() : ''}
     ${S.plantillaModal ? modalPlantillas() : ''}
   </div>`;
+  animar();
 }
 
+// Dispara el motor de movimiento tras cada paint (mismo patrón que home.js):
+// anillos SVG, count-ups, entrada escalonada y tilt magnético.
+function animar() {
+  const root = S.container;
+  if (!root) return;
+  root.querySelectorAll('.v-ring-fill').forEach(c => ring(c, +c.getAttribute('data-pct') || 0));
+  root.querySelectorAll('[data-count]').forEach(el => {
+    const to = +el.getAttribute('data-count') || 0;
+    const suffix = el.getAttribute('data-suffix') || '';
+    const decimals = +el.getAttribute('data-dec') || 0;
+    countUp(el, to, { suffix, decimals });
+  });
+  stagger(root.querySelectorAll('.rise'));
+  tiltAll(root);
+}
+
+// Chip de ayuno EN VIVO (Cal AI §7): contador + micro-arco en el header.
 function chipAyuno() {
-  const ay = cfgAyuno();
-  if (!ay || !ay.ultima_comida || !ay.primera_comida) return '';
-  return `<span class="nut-ayuno" title="Ventana de ayuno">⏳ ${esc(ay.ultima_comida)} → ${esc(ay.primera_comida)}</span>`;
+  const ay = estadoAyuno();
+  if (!ay) return '';
+  const R = 9, C = 2 * Math.PI * R, off = C * (1 - ay.pct / 100);
+  const col = ay.ayunando ? 'var(--accent)' : 'var(--accent-2)';
+  return `
+  <span class="nut-ayuno${ay.ayunando ? ' nut-ayuno-on' : ''}" title="Ventana de ayuno ${esc(ay.ventana)}">
+    <svg class="nut-ayuno-arco" width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">
+      <circle class="v-ring-track" cx="11" cy="11" r="${R}" style="stroke-width:2.5"></circle>
+      <circle cx="11" cy="11" r="${R}" style="stroke-width:2.5;fill:none;stroke:${col};stroke-linecap:round;stroke-dasharray:${C.toFixed(1)};stroke-dashoffset:${off.toFixed(1)};transform:rotate(-90deg);transform-origin:center"></circle>
+    </svg>
+    <span class="nut-ayuno-txt"><strong>${esc(ay.texto)}</strong><span class="nut-ayuno-sub">${esc(ay.sub)}</span></span>
+  </span>`;
 }
 
 function vacioConfig() {
   return `
-  <div class="nut-vacio">
+  <div class="nut-vacio rise">
     <div class="nut-vacio-icono">⚙️</div>
     <p>No hay slots de comida configurados.</p>
     <p class="nut-vacio-sub">Corré el seed (sql/02_seed_nutricion.sql) o cargá la clave «slots» del módulo nutricion en user_config.</p>
@@ -746,7 +872,7 @@ function vacioConfig() {
 
 function vacioPlan() {
   return `
-  <div class="nut-vacio">
+  <div class="nut-vacio rise">
     <div class="nut-vacio-icono">🗓️</div>
     <p>Todavía no planificaste esta semana.</p>
     <p class="nut-vacio-sub">Asigná combos o alimentos a los días (o aplicá una plantilla de día) y de ahí salen el prep y las compras solos.</p>
@@ -759,54 +885,126 @@ function vistaHoy() {
   const slots = cfgSlots();
   const esHoy = S.fecha === hoyStr();
   const nav = `
-  <div class="nut-fechanav">
-    <button class="nut-nav-btn" data-action="dia-prev" aria-label="Día anterior">‹</button>
+  <div class="nut-fechanav rise">
+    <button class="nut-nav-btn lively" data-action="dia-prev" aria-label="Día anterior">‹</button>
     <div class="nut-fechanav-centro">
       <div class="nut-fechanav-label">${labelFecha(S.fecha)}</div>
       ${esHoy ? '' : `<button class="nut-chip" data-action="dia-hoy">Volver a hoy</button>`}
     </div>
-    <button class="nut-nav-btn" data-action="dia-next" aria-label="Día siguiente">›</button>
+    <button class="nut-nav-btn lively" data-action="dia-next" aria-label="Día siguiente">›</button>
   </div>`;
   if (S.cargando) return nav + `<div class="nut-cargando">Cargando el día…</div>`;
   if (!slots.length) return nav + vacioConfig();
   return nav + resumenDia() + slots.map(seccionSlot).join('');
 }
 
+/* ---------- Sparkline de proteína 7 días (mini SVG de barras) ---------- */
+function sparklineHTML() {
+  const serie = serie7();
+  const max = Math.max(cfgTarget().target || 0, ...serie.map(d => d.prot), 1);
+  const W = 168, H = 40, n = serie.length;
+  const gap = 5, bw = (W - gap * (n - 1)) / n;
+  const barras = serie.map((d, i) => {
+    const h = Math.max(2, (d.prot / max) * H);
+    const x = i * (bw + gap);
+    const y = H - h;
+    const col = d.esHoy ? 'var(--accent)' : 'var(--border-strong)';
+    const dd = parseFecha(d.fecha).getDate();
+    return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2" fill="${col}"${d.esHoy ? ' class="nut-spark-hoy"' : ''}></rect>
+      <text x="${(x + bw / 2).toFixed(1)}" y="${H + 9}" class="nut-spark-lbl" text-anchor="middle">${dd}</text>`;
+  }).join('');
+  const prom = serie.reduce((s, d) => s + d.prot, 0) / n;
+  return `
+  <div class="nut-spark rise">
+    <div class="nut-spark-cab">
+      <span class="nut-cap">Proteína · últimos 7 días</span>
+      <span class="nut-spark-prom">prom <span class="nut-num">${num(prom)}</span> g</span>
+    </div>
+    <svg class="nut-spark-svg" viewBox="0 0 ${W} ${H + 12}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Proteína de los últimos 7 días">
+      ${barras}
+    </svg>
+  </div>`;
+}
+
+/* ---------- Anillo mini de macro secundario (carbo/grasa/kcal) ---------- */
+function macroRing(valor, ref, label, unidad, color) {
+  const pct = ref > 0 ? Math.min(100, (valor / ref) * 100) : 0;
+  return `
+  <div class="nut-mring">
+    <div class="nut-mring-fig">
+      <svg width="52" height="52" viewBox="0 0 52 52">
+        <circle class="v-ring-track" cx="26" cy="26" r="21" style="stroke-width:5"></circle>
+        <circle class="v-ring-fill" cx="26" cy="26" r="21" style="stroke-width:5;stroke:${color}" data-pct="${pct}"></circle>
+      </svg>
+      <span class="nut-mring-v nut-num" data-count="${Math.round(valor)}">0</span>
+    </div>
+    <span class="nut-mring-k">${esc(label)}<span class="nut-mring-u">${esc(unidad)}</span></span>
+  </div>`;
+}
+
 function resumenDia() {
   const { target, piso } = cfgTarget();
   const tot = totalesDia();
   const cre = cfgCreatina();
-  let barra = '';
-  if (target > 0) {
-    const pct = Math.min(100, (tot.prot / target) * 100);
-    const pisoPct = piso > 0 && piso < target ? Math.min(100, (piso / target) * 100) : null;
-    const zona = tot.prot >= target ? 'ok' : (piso > 0 && tot.prot >= piso) ? 'medio' : 'bajo';
-    const restante = Math.max(0, target - tot.prot);
-    const estado = zona === 'ok'
-      ? '¡Target cumplido! 💪'
-      : `Te faltan <span class="nut-num">${num(restante)}</span> g${piso > 0 ? ` · piso ${num(piso)} g` : ''}`;
-    barra = `
-    <div class="nut-prog">
-      <div class="nut-prog-fila">
-        <div class="nut-prog-num"><span class="nut-num">${num(tot.prot)}</span><span class="nut-prog-de"> / ${num(target)} g proteína</span></div>
-        <div class="nut-prog-estado nut-zona-${zona}">${estado}</div>
+
+  // ---- Anillo HÉROE: proteína del día vs target (Cal AI §7, pero proteína). ----
+  const pct = target > 0 ? Math.min(100, (tot.prot / target) * 100) : 0;
+  const zona = target > 0
+    ? (tot.prot >= target ? 'ok' : (piso > 0 && tot.prot >= piso) ? 'medio' : 'bajo')
+    : 'medio';
+  // Framing sano (BACKLOG §7): rango/tendencia, sin límites rojos ni shaming.
+  const restante = Math.max(0, target - tot.prot);
+  let estado;
+  if (!target) estado = 'Sin target configurado';
+  else if (tot.prot >= target) estado = 'Target alcanzado';
+  else if (piso > 0 && tot.prot >= piso) estado = 'En zona · sobre el piso';
+  else estado = `Vas sumando · faltan ${num(restante)} g`;
+
+  const hero = `
+  <div class="nut-hero">
+    <div class="nut-hero-ring">
+      <svg width="164" height="164" viewBox="0 0 164 164">
+        <defs>
+          <linearGradient id="nutHeroGrad" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#35e0b2"></stop><stop offset="1" stop-color="#43d17c"></stop>
+          </linearGradient>
+        </defs>
+        <circle class="v-ring-track" cx="82" cy="82" r="70" style="stroke-width:11"></circle>
+        <circle class="v-ring-fill nut-hero-fill nut-hero-${zona}" cx="82" cy="82" r="70" style="stroke-width:11" data-pct="${pct}"></circle>
+      </svg>
+      <div class="nut-hero-centro">
+        <span class="nut-hero-num nut-num" data-count="${Math.round(tot.prot)}">0</span>
+        <span class="nut-hero-de">${target ? '/ ' + num(target) + ' g' : 'g proteína'}</span>
+        <span class="heartbeat nut-hero-heart"></span>
       </div>
-      <div class="nut-bar">
-        <div class="nut-bar-fill nut-bar-${zona}" style="width:${pct}%"></div>
-        ${pisoPct !== null ? `<div class="nut-bar-piso" style="left:${pisoPct}%" title="Piso ${num(piso)} g"></div>` : ''}
-      </div>
-    </div>`;
-  }
-  return `
-  <div class="nut-card nut-resumen">
-    ${barra}
-    <div class="nut-macros">
-      <div class="nut-macro"><span class="nut-macro-v nut-num">${num(tot.prot)}</span><span class="nut-macro-k">prot g</span></div>
-      <div class="nut-macro"><span class="nut-macro-v nut-num">${num(tot.carbo)}</span><span class="nut-macro-k">carbo g</span></div>
-      <div class="nut-macro"><span class="nut-macro-v nut-num">${num(tot.grasa)}</span><span class="nut-macro-k">grasa g</span></div>
-      <div class="nut-macro"><span class="nut-macro-v nut-num">${num(tot.kcal)}</span><span class="nut-macro-k">kcal</span></div>
     </div>
-    ${cre ? `<div class="nut-creatina">💊 Creatina ${esc(cre.tipo || '')} · ${esc(cre.dosis_g || '')} g · ${esc(cre.frecuencia || '')}</div>` : ''}
+    <div class="nut-hero-lado">
+      <span class="nut-cap">Proteína de hoy</span>
+      <div class="nut-hero-estado nut-zona-${zona}">${estado}</div>
+      ${piso > 0 ? `<div class="nut-hero-piso">Piso saludable · <span class="nut-num">${num(piso)}</span> g</div>` : ''}
+      ${cre ? `<div class="nut-creatina">💊 Creatina ${esc(cre.tipo || '')} · ${esc(cre.dosis_g || '')} g · ${esc(cre.frecuencia || '')}</div>` : ''}
+    </div>
+  </div>`;
+
+  // ---- Anillos secundarios: carbo/grasa/kcal. La referencia del anillo se
+  //      DERIVA del target de proteína del usuario (no hay valores hardcodeados:
+  //      escala con su config). Son readouts orientativos, no límites — el
+  //      número real siempre se muestra en el centro. Framing neutro (sin rojo).
+  const base = target > 0 ? target : 160;
+  const refCarbo = base * 2;      // heurística de referencia visual, no prescripción
+  const refGrasa = base * 0.6;
+  const refKcal = base * 13;
+  const secundarios = `
+  <div class="nut-mrings">
+    ${macroRing(tot.carbo, refCarbo, 'Carbo', 'g', 'var(--accent-2)')}
+    ${macroRing(tot.grasa, refGrasa, 'Grasa', 'g', 'var(--warn)')}
+    ${macroRing(tot.kcal, refKcal, 'Kcal', '', 'var(--ok)')}
+  </div>`;
+
+  return sparklineHTML() + `
+  <div class="nut-card nut-resumen rise lively" data-tilt>
+    ${hero}
+    ${secundarios}
   </div>`;
 }
 
@@ -835,7 +1033,7 @@ function seccionSlot(slot) {
   const abierto = S.picker && S.picker.slot === slot.id;
   const chip = entradas.length ? '' : chipPlanificado(slot);
   return `
-  <section class="nut-slot nut-card">
+  <section class="nut-slot nut-card rise${abierto ? '' : ' lively'}"${abierto ? '' : ' data-tilt'}>
     <header class="nut-slot-head">
       <div>
         <h3 class="nut-slot-titulo">${esc(slot.label)}</h3>
@@ -869,6 +1067,8 @@ function pickerHTML(slot) {
   else if (t === 'alimentos') cuerpo = pickerAlimentos();
   else if (t === 'manual') cuerpo = pickerManual();
   else cuerpo = pickerFavoritos(slot);
+  // Escala de porción (Cal AI §7) — en las pestañas de 1 tap, no en Manual.
+  const escala = (t === 'manual') ? '' : escalaHTML();
   return `
   <div class="nut-picker">
     <div class="nut-picker-head">
@@ -877,36 +1077,56 @@ function pickerHTML(slot) {
       </div>
       <button class="nut-icono" data-action="cerrar-picker" aria-label="Cerrar picker">✕</button>
     </div>
+    ${escala}
     ${cuerpo}
   </div>`;
 }
 
-function filaAlimento(a) {
+// Botones de escala rápida: multiplican los macros al agregar, sin tipear.
+function escalaHTML() {
+  const opts = [[0.5, '½'], [0.75, '¾'], [1, '1×'], [1.25, '1¼'], [1.5, '1½'], [2, '2×']];
+  return `
+  <div class="nut-escala">
+    <span class="nut-escala-lbl">Porción</span>
+    <div class="nut-escala-btns">
+      ${opts.map(([f, lbl]) => `<button class="nut-escala-b${S.escala === f ? ' activa' : ''}" data-action="escala" data-f="${f}">${lbl}</button>`).join('')}
+    </div>
+  </div>`;
+}
+
+// factor: multiplicador de porción vigente (1 salvo que el picker escale).
+// Muestra el macro ESCALADO (lo que se va a guardar) para que el tap sea fiel.
+function filaAlimento(a, factor = 1) {
+  const f = Number(factor) || 1;
+  const prot = (Number(a.prot) || 0) * f, kcal = (Number(a.kcal) || 0) * f;
   return `
   <div class="nut-item" data-action="add-alimento" data-id="${esc(a.id)}" role="button" tabindex="0">
     <div class="nut-item-info">
-      <div class="nut-item-nombre">${esc(a.nombre)}${a.porcion ? ` <span class="nut-item-porcion">${esc(a.porcion)}</span>` : ''}</div>
-      <div class="nut-item-macros"><span class="nut-num">${num(a.prot)}</span> g prot · ${num(a.kcal)} kcal</div>
+      <div class="nut-item-nombre">${esc(a.nombre)}${a.porcion ? ` <span class="nut-item-porcion">${esc(a.porcion)}${f !== 1 ? ' ×' + num(f) : ''}</span>` : (f !== 1 ? ` <span class="nut-item-porcion">×${num(f)}</span>` : '')}</div>
+      <div class="nut-item-macros"><span class="nut-num">${num(prot)}</span> g prot · ${num(kcal)} kcal</div>
     </div>
     <button class="nut-icono nut-star${a.favorito ? ' activa' : ''}" data-action="fav" data-tipo="alimento" data-id="${esc(a.id)}" aria-label="Marcar favorito">${a.favorito ? '★' : '☆'}</button>
   </div>`;
 }
 
-function filaCombo(c) {
+function filaCombo(c, factor = 1) {
+  const f = Number(factor) || 1;
+  const prot = (Number(c.prot) || 0) * f, kcal = (Number(c.kcal) || 0) * f;
   return `
   <div class="nut-item" data-action="add-combo" data-id="${esc(c.id)}" role="button" tabindex="0">
     <div class="nut-item-info">
-      <div class="nut-item-nombre">${esc(c.nombre)} <span class="nut-item-porcion">combo${c.slot ? ' · ' + esc(c.slot) : ''}</span></div>
-      <div class="nut-item-macros"><span class="nut-num">${num(c.prot)}</span> g prot · ${num(c.kcal)} kcal</div>
+      <div class="nut-item-nombre">${esc(c.nombre)} <span class="nut-item-porcion">combo${c.slot ? ' · ' + esc(c.slot) : ''}${f !== 1 ? ' ×' + num(f) : ''}</span></div>
+      <div class="nut-item-macros"><span class="nut-num">${num(prot)}</span> g prot · ${num(kcal)} kcal</div>
     </div>
     <button class="nut-icono nut-star${c.favorito ? ' activa' : ''}" data-action="fav" data-tipo="combo" data-id="${esc(c.id)}" aria-label="Marcar favorito">${c.favorito ? '★' : '☆'}</button>
   </div>`;
 }
 
 function pickerFavoritos(slot) {
+  const f = S.escala;
   const favs = [
-    ...combosOrdenados(slot.id).filter(c => c.favorito).map(filaCombo),
-    ...S.alimentos.filter(a => a.favorito).map(filaAlimento),
+    ...combosOrdenados(slot.id).filter(c => c.favorito).map(c => filaCombo(c, f)),
+    ...S.alimentos.filter(a => a.favorito).map(a => filaAlimento(a, f)),
   ];
   if (!favs.length) return `<div class="nut-picker-vacio">Todavía no tenés favoritos.<br>Marcá con ☆ tus alimentos y combos más usados en las otras pestañas.</div>`;
   return `<div class="nut-picker-lista">${favs.join('')}</div>`;
@@ -914,7 +1134,7 @@ function pickerFavoritos(slot) {
 
 function pickerCombos(slot) {
   if (!S.combos.length) return `<div class="nut-picker-vacio">No hay combos cargados. Corré el seed (sql/02_seed_nutricion.sql).</div>`;
-  return `<div class="nut-picker-lista">${combosOrdenados(slot.id).map(filaCombo).join('')}</div>`;
+  return `<div class="nut-picker-lista">${combosOrdenados(slot.id).map(c => filaCombo(c, S.escala)).join('')}</div>`;
 }
 
 function pickerAlimentos() {
@@ -936,7 +1156,7 @@ function listaAlimentosHTML() {
       ? 'No encontré nada con esa búsqueda.'
       : 'No hay alimentos cargados. Corré el seed (sql/02_seed_nutricion.sql).'}</div>`;
   }
-  return items.map(filaAlimento).join('');
+  return items.map(a => filaAlimento(a, S.escala)).join('');
 }
 
 function pickerManual() {
@@ -957,13 +1177,13 @@ function pickerManual() {
 function navSemana() {
   const esActual = S.semana === lunesDe(hoyStr());
   return `
-  <div class="nut-fechanav">
-    <button class="nut-nav-btn" data-action="sem-prev" aria-label="Semana anterior">‹</button>
+  <div class="nut-fechanav rise">
+    <button class="nut-nav-btn lively" data-action="sem-prev" aria-label="Semana anterior">‹</button>
     <div class="nut-fechanav-centro">
       <div class="nut-fechanav-label">Semana del ${labelCorto(S.semana)} al ${labelCorto(addDias(S.semana, 6))}</div>
       ${esActual ? '' : `<button class="nut-chip" data-action="sem-hoy">Esta semana</button>`}
     </div>
-    <button class="nut-nav-btn" data-action="sem-next" aria-label="Semana siguiente">›</button>
+    <button class="nut-nav-btn lively" data-action="sem-next" aria-label="Semana siguiente">›</button>
   </div>`;
 }
 
@@ -980,7 +1200,7 @@ function vistaSemana() {
 function diaCard(fecha, slots) {
   const esHoy = fecha === hoyStr();
   return `
-  <div class="nut-sem-dia${esHoy ? ' nut-sem-hoy' : ''}">
+  <div class="nut-sem-dia rise${esHoy ? ' nut-sem-hoy' : ''}">
     <div class="nut-sem-dia-head">${DIAS[diaIdx(fecha)]}<span class="nut-sem-fecha">${labelCorto(fecha)}</span></div>
     ${slots.map(sl => {
       const p = planDe(fecha, sl.id);
@@ -1131,7 +1351,7 @@ function vistaPrep() {
   return nav + `
   <div class="nut-prep">
     ${combos.length ? `
-    <section class="nut-card">
+    <section class="nut-card rise lively" data-tilt>
       <h3 class="nut-card-titulo">🍳 A cocinar esta semana</h3>
       ${combos.map(({ combo, veces }) => `
       <div class="nut-prep-fila">
@@ -1139,7 +1359,7 @@ function vistaPrep() {
         <div class="nut-prep-veces">× ${veces}</div>
       </div>`).join('')}
     </section>` : ''}
-    <section class="nut-card">
+    <section class="nut-card rise lively" data-tilt>
       <h3 class="nut-card-titulo">🧺 Ingredientes para el batch</h3>
       ${ingredientes.length ? ingredientes.map(i => `
       <div class="nut-prep-fila">
@@ -1158,7 +1378,7 @@ function vistaCompras() {
   if (!ingredientes.length) return nav + vacioPlan();
   const estado = comprasEstado();
   return nav + `
-  <div class="nut-card nut-compras">
+  <div class="nut-card nut-compras rise">
     <header class="nut-compras-head">
       <div>
         <h3 class="nut-card-titulo">🛒 Lista de compras</h3>
@@ -1187,16 +1407,27 @@ const CSS = `
 .nut * { box-sizing: border-box; }
 .nut button { font: inherit; color: inherit; cursor: pointer; }
 .nut button:focus-visible, .nut input:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
-.nut-num { font-family: var(--font-num); font-variant-numeric: tabular-nums; }
+.nut-num { font-family: var(--font-num); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.nut-cap { font-size: .68rem; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; color: var(--text-faint); }
 
 /* Header + tabs */
 .nut-head { display: flex; flex-direction: column; gap: var(--space-3); margin-bottom: var(--space-4); }
-.nut-head-fila { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
-.nut-titulo { margin: 0; font-family: var(--font-display); font-size: 1.35rem; letter-spacing: .01em; }
-.nut-ayuno { font-size: .75rem; color: var(--text-dim); background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: var(--space-1) var(--space-3); white-space: nowrap; }
+.nut-head-fila { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }
+.nut-titulo { margin: 0; font-family: var(--font-display); font-weight: 800; font-size: 1.35rem; letter-spacing: -.01em; }
+
+/* Chip de ayuno EN VIVO (contador + micro-arco) */
+.nut-ayuno { display: inline-flex; align-items: center; gap: var(--space-2); font-size: .75rem; color: var(--text-dim); background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 5px var(--space-3) 5px 6px; white-space: nowrap; }
+.nut-ayuno-on { border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: linear-gradient(90deg, var(--accent-soft), var(--surface)); }
+.nut-ayuno-arco { flex: none; }
+.nut-ayuno-txt { display: flex; flex-direction: column; line-height: 1.15; }
+.nut-ayuno-txt strong { color: var(--text); font-weight: 700; }
+.nut-ayuno-sub { font-size: .66rem; color: var(--text-faint); }
+.nut-ayuno-on .nut-ayuno-sub { color: var(--accent); }
+
 .nut-tabs { display: flex; gap: var(--space-2); overflow-x: auto; -webkit-overflow-scrolling: touch; }
-.nut-tab { flex: 1 1 0; min-height: 44px; padding: var(--space-2) var(--space-3); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-dim); white-space: nowrap; transition: background .15s, color .15s, border-color .15s; }
-.nut-tab.activa { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.nut-tab { flex: 1 1 0; min-height: 44px; padding: var(--space-2) var(--space-3); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-dim); white-space: nowrap; transition: background var(--dur) ease, color var(--dur) ease, border-color var(--dur) ease, transform var(--dur) var(--ease-out-expo); }
+.nut-tab:hover { transform: translateY(-1px); }
+.nut-tab.activa { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 700; }
 
 /* Navegación fecha / semana */
 .nut-fechanav { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-4); }
@@ -1207,28 +1438,47 @@ const CSS = `
 .nut-chip { background: var(--accent-soft); color: var(--accent); border: none; border-radius: 999px; padding: var(--space-1) var(--space-3); font-size: .78rem; min-height: 28px; }
 
 /* Cards */
-.nut-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--space-4); margin-bottom: var(--space-4); box-shadow: var(--shadow-1); }
-.nut-card-titulo { margin: 0 0 var(--space-3); font-family: var(--font-display); font-size: 1rem; }
+.nut-card { position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--space-4); margin-bottom: var(--space-4); box-shadow: var(--shadow-1); overflow: hidden; }
+.nut-card-titulo { margin: 0 0 var(--space-3); font-family: var(--font-display); font-weight: 700; font-size: 1rem; }
 
-/* Progreso de proteína */
-.nut-prog { margin-bottom: var(--space-4); }
-.nut-prog-fila { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; margin-bottom: var(--space-2); }
-.nut-prog-num { font-size: 1.7rem; font-weight: 700; }
-.nut-prog-de { font-size: .85rem; font-weight: 400; color: var(--text-dim); }
-.nut-prog-estado { font-size: .82rem; }
+/* ---- Zonas de color (framing sano: verde/turquesa dominan; nunca rojo duro) ---- */
 .nut-zona-ok { color: var(--ok); }
-.nut-zona-medio { color: var(--warn); }
-.nut-zona-bajo { color: var(--danger); }
-.nut-bar { position: relative; height: 14px; background: var(--surface-2); border-radius: 999px; }
-.nut-bar-fill { height: 100%; border-radius: 999px; transition: width .35s ease; }
-.nut-bar-bajo { background: var(--danger); }
-.nut-bar-medio { background: linear-gradient(90deg, var(--warn), var(--ok)); }
-.nut-bar-ok { background: linear-gradient(90deg, var(--accent), var(--ok)); }
-.nut-bar-piso { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--text-dim); border-radius: 1px; }
-.nut-macros { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-2); }
-.nut-macro { background: var(--surface-2); border-radius: var(--radius); padding: var(--space-2); text-align: center; }
-.nut-macro-v { display: block; font-size: 1.05rem; font-weight: 600; }
-.nut-macro-k { display: block; font-size: .68rem; color: var(--text-faint); text-transform: uppercase; letter-spacing: .06em; margin-top: 2px; }
+.nut-zona-medio { color: var(--accent); }
+.nut-zona-bajo { color: var(--text-dim); }
+
+/* ---- Sparkline de proteína 7 días ---- */
+.nut-spark { padding: var(--space-4); margin-bottom: var(--space-4); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-1); }
+.nut-spark-cab { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-2); margin-bottom: var(--space-3); }
+.nut-spark-prom { font-size: .74rem; color: var(--text-dim); }
+.nut-spark-svg { width: 100%; max-width: 340px; height: 56px; display: block; overflow: visible; }
+.nut-spark-lbl { fill: var(--text-faint); font-size: 7px; font-family: var(--font-num); }
+.nut-spark-hoy { filter: drop-shadow(0 0 5px color-mix(in srgb, var(--accent) 55%, transparent)); }
+
+/* ---- Resumen / hero de proteína ---- */
+.nut-resumen { background: linear-gradient(135deg, rgba(53,224,178,.06), rgba(67,209,124,.04)), var(--surface); border-color: var(--border-strong); }
+.nut-resumen::before { content: ""; position: absolute; width: 300px; height: 300px; right: -90px; top: -150px; border-radius: 50%; pointer-events: none; background: radial-gradient(circle, rgba(53,224,178,.10), transparent 65%); animation: vida-breathe 5s ease-in-out infinite; }
+.nut-hero { position: relative; display: flex; align-items: center; gap: clamp(16px, 4vw, 30px); }
+.nut-hero-ring { position: relative; width: 164px; height: 164px; flex: none; }
+.nut-hero-ring svg { width: 164px; height: 164px; transform: rotate(-90deg); }
+.nut-hero-fill { stroke: url(#nutHeroGrad); }
+.nut-hero-medio { stroke: var(--accent); }
+.nut-hero-bajo { stroke: var(--text-faint); }
+.nut-hero-centro { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+.nut-hero-num { font-weight: 800; font-size: 2.7rem; line-height: 1; color: var(--text); }
+.nut-hero-de { font-size: .8rem; color: var(--text-dim); font-family: var(--font-num); }
+.nut-hero-heart { width: 7px; height: 7px; margin-top: 4px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px 2px rgba(53,224,178,.6); }
+.nut-hero-lado { min-width: 0; flex: 1; }
+.nut-hero-estado { margin-top: 6px; font-size: 1.02rem; font-weight: 700; }
+.nut-hero-piso { margin-top: 4px; font-size: .78rem; color: var(--text-faint); }
+
+/* ---- Anillos secundarios de macros ---- */
+.nut-mrings { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-3); margin-top: var(--space-5); padding-top: var(--space-4); border-top: 1px solid var(--border); }
+.nut-mring { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.nut-mring-fig { position: relative; width: 52px; height: 52px; }
+.nut-mring-fig svg { width: 52px; height: 52px; transform: rotate(-90deg); }
+.nut-mring-v { position: absolute; inset: 0; display: grid; place-items: center; font-size: .82rem; font-weight: 700; color: var(--text); }
+.nut-mring-k { font-size: .68rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--text-dim); display: flex; align-items: baseline; gap: 3px; }
+.nut-mring-u { font-size: .58rem; color: var(--text-faint); }
 .nut-creatina { margin-top: var(--space-3); font-size: .8rem; color: var(--text-dim); }
 
 /* Slots del día */
@@ -1251,6 +1501,14 @@ const CSS = `
 /* Picker */
 .nut-picker { margin-top: var(--space-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-3); }
 .nut-picker-head { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-3); }
+
+/* Escala rápida de porción (Cal AI) */
+.nut-escala { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-3); padding: var(--space-2) var(--space-3); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+.nut-escala-lbl { font-size: .66rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); flex: none; }
+.nut-escala-btns { display: flex; gap: 4px; flex: 1; flex-wrap: wrap; }
+.nut-escala-b { flex: 1 1 0; min-width: 40px; min-height: 34px; padding: 4px 6px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-dim); font-size: .82rem; font-weight: 700; font-family: var(--font-num); transition: background var(--dur) ease, color var(--dur) ease, border-color var(--dur) ease, transform var(--dur) var(--ease-out-expo); }
+.nut-escala-b:hover { transform: translateY(-1px); color: var(--text); }
+.nut-escala-b.activa { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 .nut-picker-tabs { flex: 1; display: flex; gap: var(--space-1); overflow-x: auto; }
 .nut-ptab { min-height: 38px; padding: var(--space-1) var(--space-3); background: transparent; border: 1px solid transparent; border-radius: 999px; color: var(--text-dim); font-size: .82rem; white-space: nowrap; }
 .nut-ptab.activa { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); font-weight: 600; }
@@ -1294,9 +1552,12 @@ const CSS = `
 .nut-dia-plantilla { width: 100%; min-height: 44px; background: transparent; border: 1px dashed var(--border-strong); border-radius: var(--radius); color: var(--text-dim); font-size: .8rem; transition: color .15s, border-color .15s, background .15s; }
 .nut-dia-plantilla:hover, .nut-dia-plantilla:active { color: var(--accent-2); border-color: var(--accent-2); background: var(--accent-2-soft); }
 
-/* Modal combos */
-.nut-modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-end; justify-content: center; background: color-mix(in srgb, var(--bg) 75%, transparent); backdrop-filter: blur(2px); }
-.nut-modal-card { width: 100%; max-width: 480px; max-height: 82vh; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-lg) var(--radius-lg) 0 0; padding: var(--space-4); box-shadow: var(--shadow-2); }
+/* Modal combos — glass + entrada */
+@keyframes nut-modal-in { from { opacity: 0; transform: translateY(14px) scale(.98); } to { opacity: 1; transform: none; } }
+@keyframes nut-modal-fade { from { opacity: 0; } to { opacity: 1; } }
+.nut-modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-end; justify-content: center; background: color-mix(in srgb, var(--bg) 72%, transparent); backdrop-filter: blur(6px) saturate(1.1); animation: nut-modal-fade var(--dur) ease; }
+.nut-modal-card { width: 100%; max-width: 480px; max-height: 82vh; display: flex; flex-direction: column; background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, transparent), var(--surface)); border: 1px solid var(--border-strong); border-radius: var(--radius-lg) var(--radius-lg) 0 0; padding: var(--space-4); box-shadow: var(--shadow-2); animation: nut-modal-in var(--dur-slow) var(--ease-out-expo); }
+@media (prefers-reduced-motion: reduce) { .nut-modal, .nut-modal-card { animation: none; } }
 .nut-modal-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); margin-bottom: var(--space-3); }
 .nut-modal-titulo { margin: 0; font-family: var(--font-display); font-size: 1rem; }
 .nut-modal-body { flex: 1; overflow-y: auto; }
@@ -1340,6 +1601,14 @@ const CSS = `
 .nut-vacio .nut-btn-primario { margin-top: var(--space-3); }
 .nut-cargando { padding: var(--space-8) var(--space-4); text-align: center; color: var(--text-faint); font-size: .9rem; }
 
+/* Hero: en pantallas angostas el anillo se centra y el texto va debajo */
+@media (max-width: 480px) {
+  .nut-hero { flex-direction: column; text-align: center; }
+  .nut-hero-lado { text-align: center; }
+  .nut-hero-ring, .nut-hero-ring svg { width: 148px; height: 148px; }
+  .nut-hero-num { font-size: 2.4rem; }
+}
+
 /* Desktop */
 @media (min-width: 768px) {
   .nut { padding: var(--space-6); }
@@ -1348,7 +1617,7 @@ const CSS = `
   .nut-sem-dia { padding: var(--space-2); }
   .nut-manual-grid { grid-template-columns: repeat(4, 1fr); }
   .nut-modal { align-items: center; }
-  .nut-modal-card { border-radius: var(--radius-lg); }
+  .nut-modal-card { border-radius: var(--radius-lg); animation: nut-modal-in var(--dur-slow) var(--ease-out-expo); }
 }
 `;
 
@@ -1392,7 +1661,8 @@ export default {
     }
     container.innerHTML = `<div class="nut"><div class="nut-cargando">Cargando Nutrición…</div></div>`;
     try {
-      await Promise.all([cargarCatalogo(), cargarLog(), cargarPlan()]);
+      // hist7 es tolerante (no throw): no bloquea la carga si falla.
+      await Promise.all([cargarCatalogo(), cargarLog(), cargarPlan(), cargarHistoria7()]);
       S.ultimaCarga = Date.now();
     } catch (err) {
       toast('No se pudieron cargar los datos: ' + msgErr(err), 'error');
@@ -1413,7 +1683,7 @@ export default {
       S.cargando = true;
       paint();
       S.ultimaCarga = Date.now();
-      Promise.all([cargarLog(), cargarPlan()])
+      Promise.all([cargarLog(), cargarPlan(), cargarHistoria7()])
         .then(() => { S.cargando = false; paint(); })
         .catch(() => { S.cargando = false; paint(); toast('No se pudo actualizar el día', 'warning'); });
       return;
@@ -1422,7 +1692,7 @@ export default {
     // Refresco silencioso al volver de otra ruta (multi-device)
     if (Date.now() - S.ultimaCarga > 30000) {
       S.ultimaCarga = Date.now();
-      Promise.all([cargarLog(), cargarPlan(), cargarCatalogo()])
+      Promise.all([cargarLog(), cargarPlan(), cargarCatalogo(), cargarHistoria7()])
         .then(() => paint())
         .catch(() => { /* silencioso: la data pintada coincide con su label */ });
     }

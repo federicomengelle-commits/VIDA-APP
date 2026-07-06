@@ -1,13 +1,26 @@
 // VIDA — Módulo Insights (Fase 5a · determinístico, SIN IA todavía)
-// Dashboard READ-ONLY: lee las tablas de los demás módulos y muestra un
-// chequeo cruzado con números reales. NUNCA escribe. Robustez máxima:
-// cada card en su propio try/catch → si una tabla no existe o falla una
-// query, esa card muestra "sin datos todavía" y el resto sigue vivo.
+// ============================================================================
+// Dashboard READ-ONLY: lee las tablas de los demás módulos y muestra un tablero
+// vivo con los números reales. NUNCA escribe. Robustez máxima: cada dominio en
+// su propio try/catch → si una tabla no existe o falla una query, esa card
+// muestra "sin datos todavía" y el resto sigue vivo.
+//
+// Rediseño "Instrumento Vivo" (BACKLOG.md §5): Insights y el Home comparten la
+// MISMA fuente de verdad de palancas → el motor puro `core/palancas.js`. Acá se
+// arma un `ctx` (mismo shape que en home.js) desde los datos que ya cargamos y
+// se pinta el Pulso VIDA + las palancas ricas con chips de origen, en vez del
+// viejo `calcularCruces()` local. La carga de datos NO cambió: sigue siendo
+// read-only, tolerante y anti-carrera.
+//
 // Contrato: docs/CONTRATOS.md §4 y §13. Roadmap: CLAUDE.md §4 (Fase 5).
 import { supabase } from '../core/supabase.js';
 // Insights lee config de OTROS módulos (nutricion.proteina_target, plata objetivos),
 // no solo la suya → importa el accessor global read-only (cache ya cargado en login).
 import { getConfig } from '../core/config.js';
+// Motor de palancas: ÚNICA fuente de verdad de los cruces (compartida con Home).
+import { calcularPalancas, pulsoVida, dominiosDe } from '../core/palancas.js';
+// Animación del rediseño: anillos vivos, count-up, entrada escalonada, tilt.
+import { countUp, ring, stagger, tiltAll } from '../core/anim.js';
 
 /* ============================================================
    Fechas — helpers locales (YYYY-MM-DD local, semana desde LUNES)
@@ -65,6 +78,7 @@ function simboloMoneda(mon) {
   return m;
 }
 function pct(parte, total) { return total > 0 ? Math.round((parte / total) * 100) : 0; }
+function clampPct(n) { return Math.max(0, Math.min(100, Number(n) || 0)); }
 // Epley 1RM estimado: peso × (1 + reps/30).
 function e1rm(peso, reps) { return (Number(peso) || 0) * (1 + (Number(reps) || 0) / 30); }
 
@@ -79,12 +93,14 @@ const S = {
   boundEl: null,
   rango: 7,              // 7 | 30 — rango global donde aplica
   cargando: true,
+  cargandoRango: false,
   // Resultado por dominio: { estado: 'ok'|'vacio'|'error', ...datos }
   nutricion: null,
   plata: null,
   rutina: null,
   training: null,
-  cruces: null,
+  palancas: null,        // salida de calcularPalancas(ctx) (sin el Pulso p15)
+  pulso: null,           // salida de pulsoVida(ctx)
   cargaId: 0,            // anti-carrera: cada carga incrementa; respuestas viejas se descartan
 };
 
@@ -111,6 +127,7 @@ function categoriasActividad() {
 /* ============================================================
    Cargas por dominio — cada una TOLERANTE a tabla ausente / query rota.
    Devuelven un objeto de estado; NUNCA hacen throw hacia afuera.
+   (SIN CAMBIOS respecto de la versión previa: mismas queries, mismos campos.)
    ============================================================ */
 
 // ---- Nutrición: proteína hoy vs target, promedio 7d, días que llegó al piso ----
@@ -467,50 +484,90 @@ async function conPRsVacio(hoy) {
   };
 }
 
-// ---- Cruces determinísticos (solo con data de ambos lados) ----
-function calcularCruces() {
-  const out = [];
-  const nut = S.nutricion;
-  const rut = S.rutina;
-  const tra = S.training;
-  const pla = S.plata;
+/* ============================================================
+   ctx para el motor de palancas — MISMA fuente de verdad que el Home.
+   Traduce el estado ya cargado (S.nutricion/plata/rutina/training) al shape
+   documentado en core/palancas.js. Es un mapeo PURO sobre datos en memoria: no
+   dispara queries nuevas (Insights es read-only). Los campos de acción 1-tap que
+   Insights no computa (creatina/sesionHoy exacto) se derivan de lo disponible o
+   se omiten → las palancas que los exigen no disparan, y las ricas (semana,
+   gym vs. uso, días sin entrenar) sí. BACKLOG.md §5.
+   ============================================================ */
+function armarCtx() {
+  const ok = (x) => x && x.estado !== 'error' && x.estado !== 'vacio';
+  const n = S.nutricion, p = S.plata, r = S.rutina, t = S.training;
 
-  // 1) Adherencia de rutina (7d) vs proteína promedio (7d).
-  if (rut && rut.estado === 'ok' && rut.adh7 != null && nut && nut.estado === 'ok' && nut.target != null) {
-    const adh = rut.adh7; // ventana fija de 7 días, en línea con prom7
-    const cumpleProt = nut.prom7 >= nut.target;
-    let txt;
-    if (adh >= 70 && cumpleProt) txt = 'Semana redonda: adherencia alta y proteína en target. Sostené el ritmo.';
-    else if (adh >= 70 && !cumpleProt) txt = 'Buena adherencia a la rutina, pero la proteína promedio quedó bajo el target. Ojo con la comida.';
-    else if (adh < 70 && cumpleProt) txt = 'La proteína viene bien, pero la adherencia a la rutina está floja. Ahí hay margen.';
-    else txt = 'Semana para reenganchar: adherencia y proteína quedaron por debajo. Un ítem a la vez.';
-    out.push({ icono: '🔗', titulo: 'Rutina vs. proteína (7 días)', texto: txt,
-      dato: `Adherencia ${adh}% · Proteína prom ${fmtNum(nut.prom7)} g / ${fmtNum(nut.target)} g` });
-  }
+  // Nutrición: renombra target→protTarget, piso→protPiso (shape de palancas).
+  // compensacion se lee de config (read-only) para enriquecer el texto del refuerzo.
+  const nutricion = ok(n) ? {
+    protHoy: n.protHoy,
+    protTarget: n.target != null ? n.target : null,
+    protPiso: n.piso != null ? n.piso : null,
+    prom7: n.prom7,
+    compensacion: getConfig('nutricion', 'compensacion', null),
+  } : null;
 
-  // 2) Gasto en Gym/Salud vs sesiones de training (mes actual / rango).
-  if (pla && pla.estado === 'ok' && tra && tra.estado === 'ok') {
-    const nGasto = (pla.gastoGymSalud || []).length;
-    if (nGasto > 0) {
-      const ses = tra.sesiones30;
-      let txt;
-      if (ses > 0) txt = `Estás pagando salud/actividad y entrenando (${fmtNum(ses)} sesiones en 30 días). El gasto se está usando.`;
-      else txt = 'Hay gasto en salud/actividad este mes pero no registraste sesiones de training en 30 días. ¿Plata sin uso?';
-      out.push({ icono: '💪', titulo: 'Salud/actividad vs. entrenamiento', texto: txt,
-        dato: `${nGasto} movimiento(s) · ${fmtNum(ses)} sesiones (30d)` });
+  // Plata: deriva el gasto fitness del mes desde la lista gastoGymSalud que ya
+  // arma cargarPlata (misma categorización por léxico). balanceMes = balance de
+  // la moneda principal (la de mayor movimiento del mes actual).
+  let plata = null;
+  if (ok(p)) {
+    const movs = Array.isArray(p.gastoGymSalud) ? p.gastoGymSalud : [];
+    let gastoFitnessMes = 0, gastoFitnessMoneda = '';
+    for (const m of movs) {
+      gastoFitnessMes += Number(m.monto) || 0;
+      if (!gastoFitnessMoneda) gastoFitnessMoneda = String(m.moneda || '').toUpperCase();
     }
-  }
-
-  // 3) Días sin entrenar (señal simple pero útil).
-  if (tra && tra.estado === 'ok' && tra.diasSinEntrenar != null) {
-    if (tra.diasSinEntrenar >= 4) {
-      out.push({ icono: '⏳', titulo: 'Días sin entrenar', texto:
-        `Van ${fmtNum(tra.diasSinEntrenar)} días desde tu última sesión. Si no fue descanso planeado, quizás toca volver.`,
-        dato: 'Última sesión: ' + esc(tra.ultima) });
+    const balances = Array.isArray(p.balances) ? p.balances : [];
+    let principal = null, maxMov = -1;
+    for (const b of balances) {
+      const mov = (Number(b.ingreso) || 0) + (Number(b.egreso) || 0);
+      if (mov > maxMov) { maxMov = mov; principal = b; }
     }
+    plata = {
+      gastoFitnessMes,
+      gastoFitnessMoneda,
+      nMovFitnessMes: movs.length,
+      balanceMes: principal ? principal.balance : null,
+    };
   }
 
-  return out;
+  // Rutina: renombra adh7→adherencia7, racha→rachaMax. La creatina no se computa
+  // acá (Insights no escanea items) → se pasan flags en false; P2/P14 no disparan.
+  const rutina = ok(r) ? {
+    adherencia7: r.adh7 != null ? r.adh7 : null,
+    rachaMax: r.racha != null ? r.racha : 0,
+    tieneItemCreatinaHoy: false,
+    creatinaHoyTildada: false,
+    creatinaRutinaId: null,
+    creatinaItemId: null,
+  } : null;
+
+  // Training: sesionHoy se deriva de diasSinEntrenar===0 (aprox. suficiente para
+  // los cruces read-only; P14/P1 dependen de entreno de hoy y acá solo informan).
+  const training = ok(t) ? {
+    sesionHoy: t.diasSinEntrenar === 0,
+    sesiones30: t.sesiones30 != null ? t.sesiones30 : 0,
+    diasSinEntrenar: t.diasSinEntrenar != null ? t.diasSinEntrenar : null,
+    volumen7: t.volumen7 != null ? t.volumen7 : 0,
+  } : null;
+
+  return {
+    hoy: hoyStr(),
+    config: {
+      umbrales: getConfig('insights', 'umbrales', null),
+      pulso_pesos: getConfig('insights', 'pulso_pesos', null),
+    },
+    nutricion, plata, rutina, training,
+  };
+}
+
+// Recalcula Pulso + palancas desde el estado actual (tras cada carga).
+function recalcularPalancas() {
+  const ctx = armarCtx();
+  S.pulso = pulsoVida(ctx);
+  // El Pulso (p15) va en su propio panel arriba → lo sacamos de la lista de cards.
+  S.palancas = calcularPalancas(ctx).filter(p => p.id !== 'p15');
 }
 
 /* ============================================================
@@ -530,7 +587,7 @@ async function cargarTodo() {
   S.plata = pla;
   S.rutina = rut;
   S.training = tra;
-  S.cruces = calcularCruces();
+  recalcularPalancas();
   S.cargando = false;
   paint();
 }
@@ -543,7 +600,7 @@ async function recargarPorRango() {
   const rut = await cargarRutina();
   if (id !== S.cargaId) return;
   S.rutina = rut;
-  S.cruces = calcularCruces();
+  recalcularPalancas();
   S.cargandoRango = false;
   paint();
 }
@@ -572,6 +629,23 @@ function onClick(e) {
 }
 
 /* ============================================================
+   Animación — dispara anillos + count-up + entrada + tilt tras cada paint.
+   ============================================================ */
+function animar() {
+  const c = S.container;
+  if (!c) return;
+  c.querySelectorAll('.v-ring-fill').forEach(el => ring(el, +el.getAttribute('data-pct') || 0));
+  c.querySelectorAll('[data-count]').forEach(el => {
+    const to = +el.getAttribute('data-count') || 0;
+    const suffix = el.getAttribute('data-suffix') || '';
+    const dec = +el.getAttribute('data-dec') || 0;
+    countUp(el, to, { suffix, decimals: dec });
+  });
+  stagger(c.querySelectorAll('.rise'));
+  tiltAll(c);
+}
+
+/* ============================================================
    Vistas — el DOM del módulo se reconstruye entero en cada paint()
    ============================================================ */
 function paint() {
@@ -589,31 +663,40 @@ function paint() {
   }
   S.container.innerHTML = `
   <div class="ins">
-    <header class="ins-head">
+    <header class="ins-head rise">
       <div class="ins-head-fila">
-        <h2 class="ins-titulo">Insights</h2>
+        <div>
+          <h2 class="ins-titulo">Insights</h2>
+          <p class="ins-sub">Chequeo cruzado con tus números reales. Solo lectura.</p>
+        </div>
         <div class="ins-rango" role="group" aria-label="Rango de análisis">
           <button class="ins-rango-btn${S.rango === 7 ? ' activa' : ''}" data-action="rango" data-rango="7">7 días</button>
           <button class="ins-rango-btn${S.rango === 30 ? ' activa' : ''}" data-action="rango" data-rango="30">30 días</button>
         </div>
       </div>
-      <p class="ins-sub">Chequeo cruzado con tus números reales. Solo lectura.</p>
     </header>
+
+    ${panelPulso()}
+
+    <div class="ins-lbl rise"><span class="ins-cap">Palancas · lo que el sistema cruzó</span><span class="ins-rule"></span></div>
+    <section class="ins-palancas">${seccionPalancas()}</section>
+
+    <div class="ins-lbl rise"><span class="ins-cap">Tus núcleos · en detalle</span><span class="ins-rule"></span></div>
     <div class="ins-grid">
       ${cardSugerencias()}
-      ${cardCruces()}
       ${cardNutricion()}
       ${cardPlata()}
       ${cardRutina()}
       ${cardTraining()}
     </div>
   </div>`;
+  animar();
 }
 
 // Envoltorio de card genérico con encabezado.
 function card(icono, titulo, cuerpo, extraClase = '') {
   return `
-  <section class="ins-card ${extraClase}">
+  <section class="ins-card rise lively ${extraClase}" data-tilt>
     <div class="ins-card-head">
       <span class="ins-card-icono">${icono}</span>
       <h3 class="ins-card-titulo">${esc(titulo)}</h3>
@@ -622,15 +705,130 @@ function card(icono, titulo, cuerpo, extraClase = '') {
   </section>`;
 }
 
-function loadingCuerpo() { return `<div class="ins-cargando">Cargando…</div>`; }
+function loadingCuerpo() { return `<div class="ins-cargando"><span class="ins-cargando-dot"></span>Cargando…</div>`; }
 function sinDatosCuerpo(msg) {
   return `<div class="ins-sindatos"><span class="ins-sindatos-ic">—</span><span>${esc(msg || 'Sin datos todavía')}</span></div>`;
+}
+
+// Anillo vivo reutilizable: SVG de radio 26 + número que cuenta al centro.
+// `color` es una var()/color CSS; `suffix` va pegado al número (ej. '%').
+function anilloVivo(pctValor, textoCentro, color, opts = {}) {
+  const p = clampPct(pctValor);
+  const suffix = opts.suffix || '';
+  const dec = opts.dec || 0;
+  const size = opts.size || 72;
+  const sw = opts.sw || 7;
+  const r = 26;
+  const centro = textoCentro != null
+    ? `<div class="ins-ring-mini" data-count="${textoCentro}" data-suffix="${esc(suffix)}" data-dec="${dec}" style="color:${color}">0${esc(suffix)}</div>`
+    : `<div class="ins-ring-mini" style="color:${color}">—</div>`;
+  return `
+    <div class="ins-ring" style="width:${size}px;height:${size}px">
+      <svg viewBox="0 0 64 64" width="${size}" height="${size}">
+        <circle class="v-ring-track" cx="32" cy="32" r="${r}" style="stroke-width:${sw}"></circle>
+        <circle class="v-ring-fill" cx="32" cy="32" r="${r}" style="stroke-width:${sw};stroke:${color}" data-pct="${p}"></circle>
+      </svg>
+      ${centro}
+    </div>`;
+}
+
+/* ---------- Panel PULSO VIDA (arriba de todo, compartido con Home) ---------- */
+function panelPulso() {
+  if (S.cargando) {
+    return `<section class="ins-pulse rise">
+      <div class="ins-pulse-ring shimmer" style="border-radius:50%"></div>
+      <div class="ins-pulse-body" style="flex:1">
+        <div class="shimmer" style="height:12px;width:35%;margin-bottom:10px"></div>
+        <div class="shimmer" style="height:24px;width:75%"></div>
+      </div>
+    </section>`;
+  }
+  const pulso = S.pulso;
+  if (!pulso) {
+    // Sin ≥2 dominios con data el Pulso no es significativo → placeholder sobrio.
+    return `<section class="ins-pulse ins-pulse-vacio rise">
+      <div class="ins-pulse-ring ins-pulse-ring-off"><span class="ins-pulse-off-n">—</span></div>
+      <div class="ins-pulse-body">
+        <span class="ins-cap">Pulso VIDA</span>
+        <p class="ins-pulse-txt">Todavía falta data en dos o más módulos para calcular tu pulso. Cargá comida, rutina y entrenos unos días.</p>
+      </div>
+    </section>`;
+  }
+  const comps = (pulso.componentes || []).map(c => {
+    const lbl = c.k === 'adherencia' ? 'Rutina' : (c.k === 'proteina' ? 'Cuerpo' : 'Training');
+    const col = c.k === 'adherencia' ? 'var(--ok)' : (c.k === 'proteina' ? 'var(--accent)' : 'var(--accent-2)');
+    return `<div class="ins-feed"><div class="ins-feed-top"><span>${lbl}</span><span class="ins-num">${c.pct}</span></div>
+      <div class="ins-feed-bar"><div class="ins-feed-fill" style="width:${clampPct(c.pct)}%;background:${col}"></div></div></div>`;
+  }).join('');
+  return `
+  <section class="ins-pulse ins-pulse-z-${esc(pulso.zona)} rise">
+    <div class="ins-pulse-ring">
+      <svg width="112" height="112" viewBox="0 0 112 112">
+        <defs><linearGradient id="insPulseGrad" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#35e0b2"></stop><stop offset="1" stop-color="#5aa2ff"></stop>
+        </linearGradient></defs>
+        <circle class="v-ring-track" cx="56" cy="56" r="46" style="stroke-width:8"></circle>
+        <circle class="v-ring-fill ins-pulse-fill" cx="56" cy="56" r="46" style="stroke-width:8" data-pct="${pulso.score}"></circle>
+      </svg>
+      <div class="ins-pulse-center">
+        <span class="ins-pulse-score ins-num" data-count="${pulso.score}">0</span>
+        <span class="heartbeat ins-pulse-heart"></span>
+      </div>
+    </div>
+    <div class="ins-pulse-body">
+      <span class="ins-cap">Pulso VIDA</span>
+      <p class="ins-pulse-txt">${esc(pulso.texto)}</p>
+      ${comps ? `<div class="ins-feeds">${comps}</div>` : ''}
+    </div>
+  </section>`;
+}
+
+/* ---------- Sección PALANCAS (reemplaza el viejo calcularCruces) ---------- */
+// Chips de origen de cada palanca (🥩 Cuerpo · 🏋️ Training…) vía dominiosDe.
+function crossHtml(cruza) {
+  const nodes = dominiosDe(cruza);
+  if (!nodes.length) return '';
+  return `<div class="ins-cross">${nodes.map((n, i) =>
+    `${i > 0 ? '<span class="ins-linknode"></span>' : ''}<span class="ins-node ins-node-${esc(n.id)}">${n.icono} ${esc(n.label)}</span>`
+  ).join('')}</div>`;
+}
+
+// Una palanca rica (misma info que en Home, pero Insights no ejecuta acciones:
+// las tareas/acción se muestran como lectura, sin botones 1-tap).
+function palancaHtml(p) {
+  const tareas = Array.isArray(p.tareas) && p.tareas.length ? `
+    <div class="ins-tareas">${p.tareas.map(t => `
+      <div class="ins-tarea ${t.hecho ? 'ins-tarea-ok' : ''}">
+        <span class="ins-tarea-mark">${t.hecho ? '✓' : '○'}</span>
+        <span class="ins-tarea-lbl">${esc(t.label)}</span>
+      </div>`).join('')}</div>` : '';
+  return `
+    <article class="ins-palanca rise lively" data-tilt>
+      <div class="ins-palanca-head">
+        <span class="ins-palanca-ic">${p.icono || '⚡'}</span>
+        ${crossHtml(p.cruza)}
+      </div>
+      <p class="ins-palanca-txt">${esc(p.texto)}</p>
+      ${p.dato ? `<div class="ins-palanca-dato ins-num">${esc(p.dato)}</div>` : ''}
+      ${tareas}
+    </article>`;
+}
+
+function seccionPalancas() {
+  if (S.cargando || S.cargandoRango) {
+    return `<div class="ins-palanca ins-palanca-skel"><div class="shimmer" style="height:70px"></div></div>`;
+  }
+  const palancas = S.palancas || [];
+  if (!palancas.length) {
+    return `<div class="ins-empty">Todavía no hay suficiente data en dos o más módulos para cruzar. Cargá comida, rutina y entrenos unos días y el sistema empieza a encontrar palancas.</div>`;
+  }
+  return palancas.map(palancaHtml).join('');
 }
 
 /* ---------- Card Sugerencias (PRÓXIMAMENTE — no simular IA) ---------- */
 function cardSugerencias() {
   return `
-  <section class="ins-card ins-card-destacada">
+  <section class="ins-card ins-card-destacada rise lively" data-tilt>
     <div class="ins-card-head">
       <span class="ins-card-icono">✨</span>
       <h3 class="ins-card-titulo">Sugerencias</h3>
@@ -644,23 +842,6 @@ function cardSugerencias() {
   </section>`;
 }
 
-/* ---------- Card Cruces ---------- */
-function cardCruces() {
-  if (S.cargando || S.cargandoRango) return card('🔗', 'Cruces', loadingCuerpo());
-  const cruces = S.cruces || [];
-  if (!cruces.length) {
-    return card('🔗', 'Cruces',
-      sinDatosCuerpo('Todavía no hay suficiente data en dos o más módulos para cruzar. Cargá comida, rutina y entrenos unos días.'));
-  }
-  const cuerpo = `<div class="ins-cruces">${cruces.map(c => `
-    <div class="ins-cruce">
-      <div class="ins-cruce-head"><span class="ins-cruce-ic">${c.icono}</span><span class="ins-cruce-tit">${esc(c.titulo)}</span></div>
-      <p class="ins-cruce-txt">${esc(c.texto)}</p>
-      ${c.dato ? `<div class="ins-cruce-dato ins-num">${esc(c.dato)}</div>` : ''}
-    </div>`).join('')}</div>`;
-  return card('🔗', 'Cruces', cuerpo, 'ins-card-cruces');
-}
-
 /* ---------- Card Nutrición ---------- */
 function cardNutricion() {
   if (S.cargando) return card('🥩', 'Nutrición', loadingCuerpo());
@@ -669,14 +850,17 @@ function cardNutricion() {
   if (n.estado === 'vacio') return card('🥩', 'Nutrición', sinDatosCuerpo('Todavía no registraste comidas esta semana.'));
   const tieneTarget = n.target != null;
   const pctHoy = tieneTarget ? Math.min(100, (n.protHoy / n.target) * 100) : 0;
-  const claseHoy = !tieneTarget ? '' : (n.protHoy >= n.target ? 'ins-bar-ok' : (n.piso != null && n.protHoy >= n.piso ? 'ins-bar-warn' : 'ins-bar-bajo'));
+  const colorAnillo = !tieneTarget ? 'var(--text-faint)'
+    : (n.protHoy >= n.target ? 'var(--ok)' : (n.piso != null && n.protHoy >= n.piso ? 'var(--warn)' : 'var(--danger)'));
   const cuerpo = `
-    <div class="ins-metrica">
-      <div class="ins-metrica-fila">
-        <span class="ins-metrica-k">Proteína hoy</span>
-        <span class="ins-metrica-v ins-num">${fmtNum(n.protHoy)} g${tieneTarget ? ` <span class="ins-metrica-de">/ ${fmtNum(n.target)}</span>` : ''}</span>
+    <div class="ins-hero">
+      ${tieneTarget
+        ? anilloVivo(pctHoy, Math.round(pctHoy), colorAnillo, { suffix: '%' })
+        : anilloVivo(0, null, 'var(--text-faint)')}
+      <div class="ins-hero-read">
+        <div class="ins-hero-val"><span class="ins-num" data-count="${Math.round(n.protHoy)}" data-suffix=" g">0 g</span></div>
+        <div class="ins-hero-sub">Proteína hoy${tieneTarget ? ` · target ${fmtNum(n.target)} g` : ''}</div>
       </div>
-      ${tieneTarget ? `<div class="ins-bar"><div class="ins-bar-fill ${claseHoy}" style="width:${pctHoy}%"></div></div>` : ''}
     </div>
     <div class="ins-datos">
       <div class="ins-dato">
@@ -727,10 +911,10 @@ function cardPlata() {
     const pctObj = tieneTarget ? Math.min(100, (o.aportado / o.target) * 100) : 0;
     cuerpo += `
     <div class="ins-objetivo">
-      <div class="ins-objetivo-head"><span class="ins-objetivo-nombre">🎯 ${esc(o.nombre)}</span></div>
+      <div class="ins-objetivo-head"><span class="ins-objetivo-nombre">🎯 ${esc(o.nombre)}</span>${tieneTarget ? `<span class="ins-objetivo-pct ins-num">${Math.floor(pctObj)}%</span>` : ''}</div>
       ${tieneTarget ? `
       <div class="ins-bar"><div class="ins-bar-fill ins-bar-accent" style="width:${pctObj}%"></div></div>
-      <div class="ins-objetivo-sub ins-num">${fmtMonto(o.aportado, o.moneda)} / ${fmtMonto(o.target, o.moneda)} · ${Math.floor(pctObj)}%</div>`
+      <div class="ins-objetivo-sub ins-num">${fmtMonto(o.aportado, o.moneda)} / ${fmtMonto(o.target, o.moneda)}</div>`
       : `<div class="ins-objetivo-sub ins-num">${fmtMonto(o.aportado, o.moneda)} aportado · sin target definido</div>`}
     </div>`;
   }
@@ -744,17 +928,13 @@ function cardRutina() {
   if (!r || r.estado === 'error') return card('☀️', 'Rutina', sinDatosCuerpo('No se pudo leer Rutina (¿corriste sql/05?).'));
   if (r.estado === 'vacio') return card('☀️', 'Rutina', sinDatosCuerpo('Todavía no tenés rutinas activas.'));
   const cuerpo = `
-    <div class="ins-datos">
-      <div class="ins-dato">
-        <span class="ins-dato-v ins-num">${r.adherenciaGlobal}%</span>
-        <span class="ins-dato-k">Adherencia ${r.dias} días</span>
-      </div>
-      <div class="ins-dato">
-        <span class="ins-dato-v ins-num">${fmtNum(r.racha)}</span>
-        <span class="ins-dato-k">Racha (días completos)</span>
+    <div class="ins-hero">
+      ${anilloVivo(r.adherenciaGlobal, r.adherenciaGlobal, 'var(--ok)', { suffix: '%' })}
+      <div class="ins-hero-read">
+        <div class="ins-hero-val"><span class="ins-num" data-count="${fmtNumRaw(r.racha)}">0</span></div>
+        <div class="ins-hero-sub">Racha (días completos) · adherencia ${r.dias} días</div>
       </div>
     </div>
-    <div class="ins-bar"><div class="ins-bar-fill ins-bar-accent" style="width:${r.adherenciaGlobal}%"></div></div>
     ${(r.mejor || r.peor) ? `
     <div class="ins-mejorpeor">
       ${r.mejor ? `<div class="ins-mp ins-mp-mejor"><span class="ins-mp-k">Mejor</span><span class="ins-mp-v">${esc(r.mejor.icono || '')} ${esc(r.mejor.nombre)} · ${r.mejor.pct}%</span></div>` : ''}
@@ -771,11 +951,11 @@ function cardTraining() {
   const cuerpo = `
     <div class="ins-datos">
       <div class="ins-dato">
-        <span class="ins-dato-v ins-num">${fmtNum(t.sesiones7)}</span>
+        <span class="ins-dato-v ins-num" data-count="${fmtNumRaw(t.sesiones7)}">0</span>
         <span class="ins-dato-k">Sesiones 7 días</span>
       </div>
       <div class="ins-dato">
-        <span class="ins-dato-v ins-num">${fmtNum(t.sesiones30)}</span>
+        <span class="ins-dato-v ins-num" data-count="${fmtNumRaw(t.sesiones30)}">0</span>
         <span class="ins-dato-k">Sesiones 30 días</span>
       </div>
     </div>
@@ -800,34 +980,91 @@ function cardTraining() {
   return card('🏋️', 'Training', cuerpo);
 }
 
+// Valor numérico crudo para data-count (el count-up formatea; acá solo el número).
+function fmtNumRaw(n) { return Number(n) || 0; }
+
 /* ============================================================
-   Estilos — inyectados 1 vez, prefijo ins-, solo var(--token)
+   Estilos — inyectados 1 vez, prefijo ins-, solo var(--token) + motion.css
    ============================================================ */
 const CSS = `
-.ins { max-width: 900px; margin: 0 auto; padding: var(--space-4); font-family: var(--font-ui); color: var(--text); }
+.ins { max-width: 1040px; margin: 0 auto; padding: var(--space-4) 0 var(--space-6); font-family: var(--font-ui); color: var(--text); }
 .ins * { box-sizing: border-box; }
 .ins button { font: inherit; color: inherit; cursor: pointer; }
 .ins button:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
-.ins-num { font-family: var(--font-num); font-variant-numeric: tabular-nums; }
+.ins-num { font-family: var(--font-num); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.ins-cap { font-size: .68rem; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; color: var(--text-faint); }
 
 /* Header */
-.ins-head { margin-bottom: var(--space-4); }
-.ins-head-fila { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }
-.ins-titulo { margin: 0; font-family: var(--font-display); font-size: 1.35rem; letter-spacing: .01em; }
-.ins-sub { margin: var(--space-2) 0 0; font-size: .82rem; color: var(--text-dim); }
-.ins-rango { display: flex; gap: var(--space-1); background: var(--surface-2); border-radius: var(--radius); padding: var(--space-1); }
-.ins-rango-btn { min-height: 38px; padding: var(--space-1) var(--space-3); border: none; border-radius: var(--radius-sm); background: transparent; color: var(--text-dim); font-weight: 600; font-size: .82rem; transition: background .15s, color .15s; }
+.ins-head { margin-bottom: var(--space-5); }
+.ins-head-fila { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }
+.ins-titulo { margin: 0; font-family: var(--font-display); font-weight: 800; font-size: clamp(1.5rem, 3.5vw, 2rem); letter-spacing: -.02em; }
+.ins-sub { margin: var(--space-1) 0 0; font-size: .88rem; color: var(--text-dim); }
+.ins-rango { display: flex; gap: var(--space-1); background: var(--surface-2); border-radius: var(--radius); padding: var(--space-1); flex: none; }
+.ins-rango-btn { min-height: 38px; padding: var(--space-1) var(--space-3); border: none; border-radius: var(--radius-sm); background: transparent; color: var(--text-dim); font-weight: 600; font-size: .82rem; transition: background var(--dur) ease, color var(--dur) ease; }
 .ins-rango-btn.activa { background: var(--accent-soft); color: var(--accent); }
+
+/* Label de sección */
+.ins-lbl { display: flex; align-items: center; gap: var(--space-3); margin: 0 2px var(--space-3); }
+.ins-rule { flex: 1; height: 1px; background: linear-gradient(90deg, var(--border-strong), transparent); }
+
+/* ---- Pulso VIDA ---- */
+.ins-pulse { position: relative; display: flex; align-items: center; gap: clamp(16px, 3vw, 28px); padding: clamp(18px, 3vw, 26px); margin-bottom: var(--space-6); border-radius: var(--radius-lg); overflow: hidden;
+  background: linear-gradient(135deg, rgba(53,224,178,.07), rgba(90,162,255,.06)), var(--surface); border: 1px solid var(--border-strong); }
+.ins-pulse::before { content: ""; position: absolute; width: 320px; height: 320px; left: -50px; top: -140px; border-radius: 50%; pointer-events: none;
+  background: radial-gradient(circle, rgba(53,224,178,.12), transparent 65%); animation: vida-breathe 5s ease-in-out infinite; }
+.ins-pulse-z-bajo::before { background: radial-gradient(circle, rgba(242,109,109,.10), transparent 65%); }
+.ins-pulse-ring { position: relative; width: 112px; height: 112px; flex: none; }
+.ins-pulse-ring svg { transform: rotate(-90deg); }
+.ins-pulse-fill { stroke: url(#insPulseGrad); }
+.ins-pulse-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; }
+.ins-pulse-score { font-weight: 700; font-size: 2.1rem; line-height: 1; }
+.ins-pulse-heart { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px 2px rgba(53,224,178,.6); }
+.ins-pulse-body { min-width: 0; }
+.ins-pulse-txt { margin: var(--space-1) 0 0; color: var(--text-dim); font-size: .95rem; max-width: 52ch; line-height: 1.5; }
+.ins-feeds { display: flex; gap: var(--space-4); margin-top: var(--space-4); flex-wrap: wrap; }
+.ins-feed { display: flex; flex-direction: column; gap: 5px; min-width: 78px; }
+.ins-feed-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: .7rem; font-weight: 700; color: var(--text-dim); }
+.ins-feed-bar { height: 4px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
+.ins-feed-fill { height: 100%; border-radius: 999px; transition: width var(--dur-slow) var(--ease-out-expo); }
+/* Pulso sin data (placeholder sobrio) */
+.ins-pulse-vacio { background: var(--surface); border-style: dashed; }
+.ins-pulse-ring-off { display: grid; place-items: center; border-radius: 50%; border: 2px dashed var(--border-strong); }
+.ins-pulse-off-n { font-family: var(--font-num); font-size: 2rem; color: var(--text-faint); }
+@media (max-width: 560px) { .ins-pulse { flex-direction: column; align-items: flex-start; } .ins-feeds { width: 100%; } }
+
+/* ---- Palancas ---- */
+.ins-palancas { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); margin-bottom: var(--space-6); }
+@media (max-width: 720px) { .ins-palancas { grid-template-columns: 1fr; } }
+.ins-palanca { position: relative; padding: var(--space-5); border-radius: var(--radius-lg); background: var(--surface); border: 1px solid var(--border); overflow: hidden; }
+.ins-palanca:hover { border-color: var(--border-strong); }
+.ins-palanca-head { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-3); flex-wrap: wrap; }
+.ins-palanca-ic { width: 30px; height: 30px; border-radius: 9px; flex: none; display: grid; place-items: center; background: var(--accent-soft); font-size: 1rem; }
+.ins-cross { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ins-node { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border-radius: 999px; font-size: .62rem; font-weight: 800; letter-spacing: .03em; text-transform: uppercase; background: var(--surface-2); color: var(--text-dim); }
+.ins-node-cuerpo { background: var(--accent-soft); color: var(--accent); }
+.ins-node-plata { background: var(--accent-2-soft); color: var(--accent-2); }
+.ins-node-rutina { background: rgba(67,209,124,.13); color: var(--ok); }
+.ins-node-training { background: var(--accent-2-soft); color: var(--accent-2); }
+.ins-linknode { width: 14px; height: 1.5px; border-radius: 2px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+.ins-palanca-txt { margin: 0; font-size: .95rem; line-height: 1.5; color: var(--text); }
+.ins-palanca-dato { margin-top: var(--space-2); font-size: .76rem; color: var(--text-faint); }
+.ins-tareas { margin-top: var(--space-3); display: flex; flex-direction: column; gap: var(--space-1); }
+.ins-tarea { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2); background: var(--surface-2); border-radius: var(--radius); font-size: .84rem; }
+.ins-tarea-mark { font-family: var(--font-num); color: var(--text-faint); }
+.ins-tarea-ok .ins-tarea-mark { color: var(--ok); }
+.ins-tarea-lbl { flex: 1; min-width: 0; }
+.ins-palanca-skel { grid-column: 1 / -1; padding: var(--space-5); border-radius: var(--radius-lg); background: var(--surface); border: 1px solid var(--border); }
+.ins-empty { grid-column: 1 / -1; padding: var(--space-6); border: 1px dashed var(--border-strong); border-radius: var(--radius-lg); color: var(--text-dim); text-align: center; font-size: .9rem; }
 
 /* Grid de cards */
 .ins-grid { display: grid; grid-template-columns: 1fr; gap: var(--space-4); }
 
 /* Card base */
-.ins-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--space-4); box-shadow: var(--shadow-1); }
-.ins-card-head { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-3); }
+.ins-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--space-5); box-shadow: var(--shadow-1); overflow: hidden; }
+.ins-card-head { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-4); }
 .ins-card-icono { font-size: 1.15rem; flex: none; }
 .ins-card-titulo { margin: 0; font-family: var(--font-display); font-size: 1rem; flex: 1; min-width: 0; }
-.ins-card-cuerpo { display: flex; flex-direction: column; gap: var(--space-3); }
+.ins-card-cuerpo { display: flex; flex-direction: column; gap: var(--space-4); }
 
 /* Card destacada (Sugerencias) */
 .ins-card-destacada { border-color: var(--accent-2); background: linear-gradient(160deg, var(--accent-2-soft), transparent 60%), var(--surface); }
@@ -836,19 +1073,20 @@ const CSS = `
 .ins-sug-sub { margin: 0; font-size: .82rem; color: var(--text-dim); }
 .ins-sug-nota { margin-top: var(--space-1); padding: var(--space-2) var(--space-3); background: var(--surface-2); border-radius: var(--radius); font-size: .78rem; color: var(--text-faint); }
 
-/* Métrica principal con barra */
-.ins-metrica-fila { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-2); margin-bottom: var(--space-2); }
-.ins-metrica-k { font-size: .8rem; color: var(--text-dim); }
-.ins-metrica-v { font-size: 1.35rem; font-weight: 700; }
-.ins-metrica-de { font-size: .85rem; color: var(--text-dim); font-weight: 400; }
+/* Hero de card con anillo vivo */
+.ins-hero { display: flex; align-items: center; gap: var(--space-4); }
+.ins-ring { position: relative; flex: none; }
+.ins-ring svg { transform: rotate(-90deg); }
+.ins-ring-mini { position: absolute; inset: 0; display: grid; place-items: center; font-family: var(--font-num); font-weight: 700; font-size: .82rem; letter-spacing: -.02em; }
+.ins-hero-read { min-width: 0; }
+.ins-hero-val { font-weight: 700; line-height: 1; }
+.ins-hero-val .ins-num { font-size: 1.7rem; }
+.ins-hero-sub { margin-top: 5px; font-size: .78rem; color: var(--text-dim); line-height: 1.35; }
 
-/* Barra de progreso */
+/* Barra de progreso (objetivo de plata) */
 .ins-bar { height: 10px; background: var(--surface-2); border-radius: 999px; overflow: hidden; }
-.ins-bar-fill { height: 100%; border-radius: 999px; background: var(--text-faint); transition: width .35s ease; }
-.ins-bar-ok { background: var(--ok); }
-.ins-bar-warn { background: var(--warn); }
-.ins-bar-bajo { background: var(--danger); }
-.ins-bar-accent { background: var(--accent); }
+.ins-bar-fill { height: 100%; border-radius: 999px; background: var(--text-faint); transition: width var(--dur-slow) var(--ease-out-expo); }
+.ins-bar-accent { background: var(--accent-2); }
 
 /* Datos en grilla (2 col) */
 .ins-datos { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
@@ -875,8 +1113,10 @@ const CSS = `
 .ins-pos { color: var(--ok); }
 .ins-neg { color: var(--danger); }
 .ins-neutro { color: var(--text-faint); }
-.ins-objetivo { padding-top: var(--space-2); border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: var(--space-2); }
+.ins-objetivo { padding-top: var(--space-3); border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: var(--space-2); }
+.ins-objetivo-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-2); }
 .ins-objetivo-nombre { font-size: .88rem; font-weight: 600; overflow-wrap: anywhere; }
+.ins-objetivo-pct { font-size: .82rem; font-weight: 700; color: var(--accent-2); }
 .ins-objetivo-sub { font-size: .78rem; color: var(--text-dim); }
 
 /* PR */
@@ -886,20 +1126,11 @@ const CSS = `
 .ins-pr-ej { font-size: .9rem; font-weight: 600; overflow-wrap: anywhere; }
 .ins-pr-dato { font-size: .78rem; color: var(--text-dim); }
 
-/* Cruces */
-.ins-card-cruces { border-color: var(--accent-soft); }
-.ins-cruces { display: flex; flex-direction: column; gap: var(--space-3); }
-.ins-cruce { padding: var(--space-3); background: var(--surface-2); border-radius: var(--radius); border-left: 3px solid var(--accent); }
-.ins-cruce-head { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-1); }
-.ins-cruce-ic { font-size: 1rem; flex: none; }
-.ins-cruce-tit { font-size: .85rem; font-weight: 700; }
-.ins-cruce-txt { margin: 0; font-size: .85rem; color: var(--text-dim); line-height: 1.4; }
-.ins-cruce-dato { margin-top: var(--space-2); font-size: .74rem; color: var(--text-faint); }
-
 /* Sin datos / cargando */
 .ins-sindatos { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-3) var(--space-2); color: var(--text-faint); font-size: .85rem; }
 .ins-sindatos-ic { font-family: var(--font-num); opacity: .6; }
-.ins-cargando { padding: var(--space-5) var(--space-2); text-align: center; color: var(--text-faint); font-size: .85rem; }
+.ins-cargando { display: flex; align-items: center; justify-content: center; gap: var(--space-2); padding: var(--space-5) var(--space-2); text-align: center; color: var(--text-faint); font-size: .85rem; }
+.ins-cargando-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: vida-heart 2.4s ease-in-out infinite; }
 
 /* Vacío global */
 .ins-vacio { padding: var(--space-8) var(--space-4); text-align: center; color: var(--text-dim); }
@@ -909,9 +1140,8 @@ const CSS = `
 
 /* Desktop: 2 columnas, destacada full-width */
 @media (min-width: 768px) {
-  .ins { padding: var(--space-6); }
   .ins-grid { grid-template-columns: 1fr 1fr; }
-  .ins-card-destacada, .ins-card-cruces { grid-column: 1 / -1; }
+  .ins-card-destacada { grid-column: 1 / -1; }
 }
 `;
 
@@ -939,8 +1169,10 @@ export default {
     S.plata = null;
     S.rutina = null;
     S.training = null;
-    S.cruces = null;
+    S.palancas = null;
+    S.pulso = null;
     S.cargando = true;
+    S.cargandoRango = false;
     inyectarEstilos();
     bind();
     if (!supabase) { paint(); return; }

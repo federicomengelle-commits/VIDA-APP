@@ -1,8 +1,18 @@
-// VIDA — Módulo Rutina (Fase 3)
+// VIDA — Módulo Rutina (Fase 3) · re-skin "Instrumento Vivo"
 // Checklist diario · Editor de rutinas · Adherencia
 // Contrato: docs/CONTRATOS.md §10. Interfaz canónica: §4.
+//
+// Re-skin (no rewrite): la lógica de datos (toggleCheck optimista, editor,
+// adherencia/racha, soft-delete, guards, estado S) se preserva EXACTA. Solo
+// cambian el paint/render y el CSS inyectado (prefijo rut-), y se agregan:
+//   · Tab Hoy: anillo de progreso por rutina + racha viva destacada arriba.
+//   · Momentos del día (AM/PM/Noche) si la rutina trae campo `momento`; si no,
+//     todo cae en "General" (no se inventan datos → degrada).
+//   · Heatmap de adherencia con entrada animada y mejor color.
+// Motor de movimiento: core/anim.js (countUp/ring/stagger/tiltAll) + motion.css.
 import { supabase } from '../core/supabase.js';
 import { toast, confirmDialog } from '../core/ui.js';
+import { countUp, ring, stagger, tiltAll } from '../core/anim.js';
 
 /* ============================================================
    Fechas — helpers locales (YYYY-MM-DD local, semana desde LUNES)
@@ -62,6 +72,34 @@ function slugUnico(txt, usados) {
 }
 
 /* ============================================================
+   Momentos del día — SOLO si la rutina trae un campo `momento`.
+   No se inventan datos: si ninguna rutina lo tiene, todo cae en
+   "General" y no se muestran secciones (degradación limpia).
+   Valores reconocidos (case-insensitive, con/ sin acento): am|manana,
+   pm|tarde, noche. Cualquier otro / ausente → 'general'.
+   ============================================================ */
+const MOMENTOS = [
+  { id: 'am', label: 'Mañana', icono: '🌅' },
+  { id: 'pm', label: 'Tarde', icono: '🌇' },
+  { id: 'noche', label: 'Noche', icono: '🌙' },
+  { id: 'general', label: 'General', icono: '📋' },
+];
+const MOMENTO_LABEL = MOMENTOS.reduce((o, m) => (o[m.id] = m, o), {});
+
+function momentoDe(r) {
+  const raw = String((r && r.momento) != null ? r.momento : '').trim().toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '');
+  if (raw === 'am' || raw === 'manana' || raw === 'am/pm' || raw === 'amanecer') return 'am';
+  if (raw === 'pm' || raw === 'tarde') return 'pm';
+  if (raw === 'noche' || raw === 'night') return 'noche';
+  return 'general';
+}
+// ¿Alguna de estas rutinas declara momento real (≠ general)? Habilita secciones.
+function hayMomentos(lista) {
+  return lista.some(r => momentoDe(r) !== 'general');
+}
+
+/* ============================================================
    Estado del módulo (el DOM se repinta entero en cada paint)
    ============================================================ */
 const S = {
@@ -83,6 +121,7 @@ const S = {
   editor: null,            // { id|null, nombre, icono, dias:[..], items:[{id,label,nota}] } → editor abierto
   lanzarModal: false,      // picker de "+ Lanzar rutina" (rutinas dias:[])
   ultimaCarga: 0,
+  _firma: null,            // firma de la última vista pintada (control de entrada animada)
 };
 
 /* ============================================================
@@ -172,6 +211,46 @@ function progresoRutina(r) {
   const total = r.items.length;
   const hechos = r.items.filter(i => checkeado(r.id, i.id)).length;
   return { total, hechos, completa: total > 0 && hechos === total };
+}
+
+// Racha viva del día (para el hero de Hoy): días consecutivos hacia atrás en
+// los que TODA rutina que aplicaba quedó completa. Se calcula sobre S.checks
+// del día visible NO alcanza (solo tiene 1 día) → esta racha usa la data del
+// tab Adherencia si está cargada; si no, degrada a la racha del día actual
+// (0 o "completo hoy"). Es un realce visual, no altera la lógica de checks.
+function rachaHoyViva() {
+  // Reusa la data de adherencia si ya la tenemos cargada (evita otra query).
+  const checks = S.adhChecks && S.adhChecks.length ? S.adhChecks : S.checks;
+  if (!checks.length || !S.rutinas.length) return 0;
+  // Índice fecha → (rutina_id → nº items tildados)
+  const conteo = new Map(); // 'rutina|fecha' → count
+  const diasConAlgo = new Set();
+  for (const c of checks) {
+    const f = String(c.fecha).slice(0, 10);
+    diasConAlgo.add(f);
+    const k = c.rutina_id + '|' + f;
+    conteo.set(k, (conteo.get(k) || 0) + 1);
+  }
+  const base = S.fecha; // arranca desde el día visible (normalmente hoy)
+  let racha = 0;
+  for (let i = 0; i < 60; i++) {
+    const f = addDias(base, -i);
+    const idx = diaIdx(f);
+    let algunaAplica = false, completo = true;
+    for (const r of S.rutinas) {
+      if (!r.activa || !r.items.length) continue;
+      let aplica;
+      if (r.dias.length) aplica = r.dias.includes(idx);
+      else aplica = diasConAlgo.has(f) && (conteo.get(r.id + '|' + f) || 0) > 0; // manual: solo si hubo actividad
+      if (!aplica) continue;
+      algunaAplica = true;
+      const hechos = conteo.get(r.id + '|' + f) || 0;
+      if (hechos < r.items.length) { completo = false; break; }
+    }
+    if (!algunaAplica) { if (i === 0) continue; else continue; } // día sin rutinas aplicables no corta
+    if (completo) racha++; else break;
+  }
+  return racha;
 }
 
 /* ============================================================
@@ -591,6 +670,8 @@ function onSubmit(e) {
 
 /* ============================================================
    Vistas — el DOM del módulo se reconstruye entero en cada paint()
+   El paint arma el HTML y, al final, dispara la animación (anillos +
+   count-up + entrada escalonada + tilt). Todo respeta reduced-motion.
    ============================================================ */
 function paint() {
   if (!S.container) return;
@@ -601,7 +682,7 @@ function paint() {
   else vista = vistaHoy();
   S.container.innerHTML = `
   <div class="rut">
-    <header class="rut-head">
+    <header class="rut-head rise">
       <h2 class="rut-titulo">Rutina</h2>
       <nav class="rut-tabs" role="tablist">
         ${tabs.map(([id, lbl]) => `
@@ -613,13 +694,60 @@ function paint() {
     ${S.editor ? modalEditor() : ''}
     ${S.lanzarModal ? modalLanzar() : ''}
   </div>`;
+  // Entrada completa solo si cambió la estructura de la vista; los toggles de
+  // check repintan con los mismos elementos y solo asientan valores.
+  const firma = firmaVista();
+  const entrada = firma !== S._firma;
+  S._firma = firma;
+  animarPaint(entrada);
+}
+
+// Firma de la vista: cambia cuando la estructura cambió (tab/día/rango, set de
+// rutinas, editor/modal). NO cambia al tildar un ítem. Sirve para animar la
+// ENTRADA completa solo en un (re)mount real y, en cambio, "asentar" los
+// valores al instante en updates in-place (togglear un check) — sin re-barrer
+// los anillos ni recontar desde 0 en cada tap. Puro presentacional.
+function firmaVista() {
+  return [
+    S.tab, S.fecha, S.adhRango,
+    S.cargando ? 'L' : '', S.cargandoAdh ? 'A' : '',
+    S.editor ? 'E' + (S.editor.id || 'nuevo') + S.editor.items.length : '',
+    S.lanzarModal ? 'M' : '',
+    S.rutinas.map(r => r.id + (r.activa ? '1' : '0')).join(','),
+  ].join('|');
+}
+
+// Dispara las animaciones del lenguaje "Instrumento Vivo" tras cada paint.
+// `entrada` = true → reproduce la coreografía de entrada (anillos desde vacío,
+// count-up, stagger). false → asienta los valores finales sin barrido.
+function animarPaint(entrada) {
+  const c = S.container;
+  if (!c) return;
+  c.querySelectorAll('.v-ring-fill').forEach(el => {
+    const pct = +el.getAttribute('data-pct') || 0;
+    if (entrada) ring(el, pct);
+    else { // asentar directo (sin sweep desde vacío)
+      const r = +el.getAttribute('r') || 26, C = 2 * Math.PI * r;
+      el.style.strokeDasharray = C.toFixed(2);
+      el.style.strokeDashoffset = (C * (1 - Math.max(0, Math.min(100, pct)) / 100)).toFixed(2);
+    }
+  });
+  c.querySelectorAll('[data-count]').forEach(el => {
+    const to = +el.getAttribute('data-count') || 0;
+    const suffix = el.getAttribute('data-suffix') || '';
+    if (entrada) countUp(el, to, { suffix, dur: +el.getAttribute('data-dur') || 900 });
+    else el.textContent = String(to) + suffix; // valor final, sin contar
+  });
+  if (entrada) stagger(c.querySelectorAll('.rise'));
+  else c.querySelectorAll('.rise').forEach(n => n.classList.add('in')); // ya visibles, sin re-animar
+  tiltAll(c);
 }
 
 /* ---------- Tab HOY ---------- */
 function vistaHoy() {
   const esHoy = S.fecha === hoyStr();
   const nav = `
-  <div class="rut-fechanav">
+  <div class="rut-fechanav rise">
     <button class="rut-nav-btn" data-action="dia-prev" aria-label="Día anterior">‹</button>
     <div class="rut-fechanav-centro">
       <div class="rut-fechanav-label">${labelFecha(S.fecha)}</div>
@@ -627,41 +755,125 @@ function vistaHoy() {
     </div>
     <button class="rut-nav-btn" data-action="dia-next" aria-label="Día siguiente">›</button>
   </div>`;
-  if (S.cargando) return nav + `<div class="rut-cargando">Cargando el día…</div>`;
+  if (S.cargando) return nav + skeletonHoy();
   if (!S.rutinas.length) return nav + vacioSinRutinas();
 
   const lista = rutinasDelDia();
   const lanzables = rutinasLanzables();
   const botonLanzar = lanzables.length
-    ? `<button class="rut-lanzar" data-action="abrir-lanzar">+ Lanzar rutina</button>`
+    ? `<button class="rut-lanzar rise" data-action="abrir-lanzar">+ Lanzar rutina</button>`
     : '';
 
   if (!lista.length) {
-    return nav + `
-    <div class="rut-vacio">
+    return nav + heroHoy(lista) + `
+    <div class="rut-vacio rise">
       <div class="rut-vacio-icono">🗓️</div>
       <p>No hay rutinas para ${esc(labelFecha(S.fecha).toLowerCase())}.</p>
       <p class="rut-vacio-sub">Ninguna rutina activa aplica a este día. Podés lanzar una manual o armar tus rutinas en la pestaña Rutinas.</p>
       ${botonLanzar}
     </div>`;
   }
-  return nav + lista.map(cardRutinaHoy).join('') + botonLanzar;
+
+  // Agrupación por momento del día (solo si alguna rutina lo declara).
+  const secciones = agruparPorMomento(lista);
+  const cuerpo = secciones.map(sec => {
+    const cards = sec.rutinas.map(cardRutinaHoy).join('');
+    if (!sec.header) return cards; // grupo "General" sin momentos → sin header
+    const m = MOMENTO_LABEL[sec.id] || MOMENTO_LABEL.general;
+    return `
+    <div class="rut-momento rise">
+      <span class="rut-momento-ic">${m.icono}</span>
+      <span class="rut-momento-lbl">${esc(m.label)}</span>
+      <span class="rut-momento-rule"></span>
+      <span class="rut-momento-n rut-num">${num(sec.rutinas.length)}</span>
+    </div>
+    ${cards}`;
+  }).join('');
+
+  return nav + heroHoy(lista) + cuerpo + botonLanzar;
+}
+
+// Hero de Hoy: resumen del día (rutinas completas / total) + racha viva.
+// Framing sano: la racha se celebra con gracia; si no hay, invita sin culpa.
+function heroHoy(lista) {
+  const total = lista.length;
+  const completas = lista.filter(r => progresoRutina(r).completa).length;
+  const totalItems = lista.reduce((n, r) => n + r.items.length, 0);
+  const hechosItems = lista.reduce((n, r) => n + progresoRutina(r).hechos, 0);
+  const pct = totalItems > 0 ? Math.round((hechosItems / totalItems) * 100) : 0;
+  const racha = rachaHoyViva();
+  const esHoy = S.fecha === hoyStr();
+
+  const rachaTxt = racha > 0
+    ? `<span class="rut-hero-racha-n rut-num" data-count="${racha}" data-dur="1000">0</span> día${racha === 1 ? '' : 's'} en racha`
+    : (esHoy ? 'Empezá tu racha hoy' : 'Sin racha en este día');
+  const rachaHint = racha > 0
+    ? (pct === 100 ? '¡Día redondo! No la cortes.' : 'Cerrá el día y la seguís sumando.')
+    : 'Completá todo lo de hoy para arrancarla.';
+
+  const arco = totalItems > 0 ? `
+    <div class="rut-hero-fig">
+      <svg width="92" height="92" viewBox="0 0 92 92" aria-hidden="true">
+        <circle class="v-ring-track" cx="46" cy="46" r="38" style="stroke-width:8"></circle>
+        <circle class="v-ring-fill" cx="46" cy="46" r="38" style="stroke-width:8" data-pct="${pct}"></circle>
+      </svg>
+      <div class="rut-hero-fig-in">
+        <span class="rut-hero-fig-pct rut-num" data-count="${pct}" data-suffix="%" data-dur="1000">0%</span>
+        <span class="rut-hero-fig-sub">${num(completas)}/${num(total)}</span>
+      </div>
+    </div>` : '';
+
+  return `
+  <section class="rut-hero rise">
+    ${arco}
+    <div class="rut-hero-body">
+      <div class="rut-hero-racha">
+        <span class="rut-hero-flame heartbeat${racha > 0 ? ' on' : ''}">🔥</span>
+        <span class="rut-hero-racha-txt">${rachaTxt}</span>
+      </div>
+      <p class="rut-hero-hint">${esc(rachaHint)}</p>
+    </div>
+  </section>`;
+}
+
+// Agrupa la lista de Hoy por momento del día. Si NINGUNA rutina declara
+// momento real → un solo grupo sin header (degradación, no se inventa nada).
+function agruparPorMomento(lista) {
+  if (!hayMomentos(lista)) {
+    return [{ id: 'general', header: false, rutinas: lista }];
+  }
+  const orden = ['am', 'pm', 'noche', 'general'];
+  const buckets = new Map(orden.map(id => [id, []]));
+  for (const r of lista) buckets.get(momentoDe(r)).push(r);
+  return orden
+    .map(id => ({ id, header: true, rutinas: buckets.get(id) }))
+    .filter(sec => sec.rutinas.length);
 }
 
 function cardRutinaHoy(r) {
   const { total, hechos, completa } = progresoRutina(r);
   const pct = total > 0 ? Math.round((hechos / total) * 100) : 0;
   const items = r.items.map(i => filaItemCheck(r, i)).join('');
+  const anillo = total > 0 ? `
+    <div class="rut-card-fig">
+      <svg width="52" height="52" viewBox="0 0 52 52" aria-hidden="true">
+        <circle class="v-ring-track" cx="26" cy="26" r="21" style="stroke-width:5"></circle>
+        <circle class="v-ring-fill${completa ? ' rut-ring-ok' : ''}" cx="26" cy="26" r="21" style="stroke-width:5" data-pct="${pct}"></circle>
+      </svg>
+      <div class="rut-card-fig-in rut-num" data-count="${hechos}" data-dur="700">0</div>
+    </div>` : '';
   return `
-  <section class="rut-card rut-rutina${completa ? ' rut-completa' : ''}">
+  <section class="rut-card rut-rutina rise lively${completa ? ' rut-completa' : ''}" data-tilt>
     <header class="rut-rutina-head">
-      <div class="rut-rutina-titulo">
-        <span class="rut-rutina-icono">${esc(r.icono || '📋')}</span>
-        <span>${esc(r.nombre)}</span>
+      ${anillo}
+      <div class="rut-rutina-info">
+        <div class="rut-rutina-titulo">
+          <span class="rut-rutina-icono">${esc(r.icono || '📋')}</span>
+          <span>${esc(r.nombre)}</span>
+        </div>
+        <div class="rut-rutina-prog"><span class="rut-num">${num(hechos)}</span> de <span class="rut-num">${num(total)}</span>${completa ? ' · Completa 💪' : ' hechos'}</div>
       </div>
-      <div class="rut-rutina-prog"><span class="rut-num">${num(hechos)}</span>/<span class="rut-num">${num(total)}</span>${completa ? ' · Completa 💪' : ''}</div>
     </header>
-    <div class="rut-bar"><div class="rut-bar-fill${completa ? ' rut-bar-ok' : ''}" style="width:${pct}%"></div></div>
     <div class="rut-items">${items || '<div class="rut-slot-vacio">Esta rutina no tiene ítems. Editala en Rutinas.</div>'}</div>
   </section>`;
 }
@@ -672,7 +884,7 @@ function filaItemCheck(r, item) {
   <button class="rut-item-check${on ? ' rut-on' : ''}" data-action="toggle-check"
     data-rutina="${esc(r.id)}" data-item="${esc(item.id)}"
     role="checkbox" aria-checked="${on}">
-    <span class="rut-box" aria-hidden="true">${on ? '✓' : ''}</span>
+    <span class="rut-box" aria-hidden="true"><span class="rut-box-tick">✓</span></span>
     <span class="rut-item-texto">
       <span class="rut-item-label">${esc(item.label)}</span>
       ${item.nota ? `<span class="rut-item-nota">${esc(item.nota)}</span>` : ''}
@@ -704,10 +916,10 @@ function modalLanzar() {
 
 /* ---------- Tab RUTINAS ---------- */
 function vistaRutinas() {
-  const nuevo = `<button class="rut-btn-primario rut-nueva" data-action="nueva-rutina">+ Nueva rutina</button>`;
+  const nuevo = `<button class="rut-btn-primario rut-nueva rise" data-action="nueva-rutina">+ Nueva rutina</button>`;
   if (!S.rutinas.length) {
     return `
-    <div class="rut-vacio">
+    <div class="rut-vacio rise">
       <div class="rut-vacio-icono">☀️</div>
       <p>Todavía no tenés rutinas.</p>
       <p class="rut-vacio-sub">Armá tu primera rutina (ej. suplementos AM, skincare) y chequeala cada mañana. Si corriste el seed (sql/05_rutina.sql) ya deberías ver la rutina «Mañana».</p>
@@ -724,8 +936,12 @@ function cardRutinaLista(r) {
   const items = r.items.length
     ? r.items.map(i => esc(i.label)).join(' · ')
     : 'Sin ítems';
+  const mom = momentoDe(r);
+  const momBadge = mom !== 'general'
+    ? `<span class="rut-momento-badge">${MOMENTO_LABEL[mom].icono} ${esc(MOMENTO_LABEL[mom].label)}</span>`
+    : '';
   return `
-  <section class="rut-card rut-rlista${r.activa ? '' : ' rut-inactiva'}">
+  <section class="rut-card rut-rlista rise lively${r.activa ? '' : ' rut-inactiva'}" data-tilt>
     <div class="rut-rlista-top">
       <div class="rut-rutina-titulo">
         <span class="rut-rutina-icono">${esc(r.icono || '📋')}</span>
@@ -737,7 +953,7 @@ function cardRutinaLista(r) {
         <button class="rut-icono rut-borrar" data-action="borrar-rutina" data-id="${esc(r.id)}" aria-label="Borrar" title="Borrar">🗑</button>
       </div>
     </div>
-    <div class="rut-rlista-dias">${dias}</div>
+    <div class="rut-rlista-dias">${dias}${momBadge}</div>
     <div class="rut-rlista-items">${items}</div>
   </section>`;
 }
@@ -792,14 +1008,14 @@ function modalEditor() {
 /* ---------- Tab ADHERENCIA ---------- */
 function vistaAdherencia() {
   const toggle = `
-  <div class="rut-adh-toggle">
+  <div class="rut-adh-toggle rise">
     <button class="rut-seg${S.adhRango === 7 ? ' activa' : ''}" data-action="adh-rango" data-rango="7">7 días</button>
     <button class="rut-seg${S.adhRango === 30 ? ' activa' : ''}" data-action="adh-rango" data-rango="30">30 días</button>
   </div>`;
-  if (S.cargandoAdh) return toggle + `<div class="rut-cargando">Calculando adherencia…</div>`;
+  if (S.cargandoAdh) return toggle + skeletonAdh();
   if (!S.rutinas.length) {
     return toggle + `
-    <div class="rut-vacio">
+    <div class="rut-vacio rise">
       <div class="rut-vacio-icono">📊</div>
       <p>Sin rutinas todavía.</p>
       <p class="rut-vacio-sub">Creá rutinas y empezá a chequearlas: acá vas a ver tu adherencia y tus rachas.</p>
@@ -809,28 +1025,56 @@ function vistaAdherencia() {
   const conDatos = filas.some(f => f.aplicable);
   if (!conDatos) {
     return toggle + `
-    <div class="rut-vacio">
+    <div class="rut-vacio rise">
       <div class="rut-vacio-icono">📊</div>
       <p>Todavía no hay datos en este rango.</p>
       <p class="rut-vacio-sub">Chequeá tus rutinas en Hoy y volvé: la adherencia se arma sola.</p>
     </div>`;
   }
-  return toggle + filas.map(f => bloqueAdherencia(f, fechas)).join('');
+  return toggle + resumenAdh(filas) + filas.map(f => bloqueAdherencia(f, fechas)).join('');
+}
+
+// Resumen superior del tab: adherencia media del rango + mejor racha viva.
+function resumenAdh(filas) {
+  const conPct = filas.filter(f => f.aplicable && f.pct != null);
+  const media = conPct.length ? Math.round(conPct.reduce((n, f) => n + f.pct, 0) / conPct.length) : null;
+  const mejorRacha = filas.reduce((mx, f) => Math.max(mx, f.racha || 0), 0);
+  if (media == null) return '';
+  const arco = `
+    <div class="rut-adh-hero-fig">
+      <svg width="84" height="84" viewBox="0 0 84 84" aria-hidden="true">
+        <circle class="v-ring-track" cx="42" cy="42" r="34" style="stroke-width:8"></circle>
+        <circle class="v-ring-fill" cx="42" cy="42" r="34" style="stroke-width:8" data-pct="${media}"></circle>
+      </svg>
+      <div class="rut-adh-hero-pct rut-num" data-count="${media}" data-suffix="%" data-dur="1000">0%</div>
+    </div>`;
+  return `
+  <section class="rut-adh-hero rise">
+    ${arco}
+    <div class="rut-adh-hero-body">
+      <span class="rut-adh-hero-lbl">Adherencia media · ${S.adhRango}d</span>
+      <div class="rut-adh-hero-racha">
+        <span class="rut-hero-flame heartbeat${mejorRacha > 0 ? ' on' : ''}">🔥</span>
+        <span>${mejorRacha > 0 ? `Mejor racha: <span class="rut-num" data-count="${mejorRacha}" data-dur="900">0</span> día${mejorRacha === 1 ? '' : 's'}` : 'Sumá tu primera racha'}</span>
+      </div>
+    </div>
+  </section>`;
 }
 
 function bloqueAdherencia(f, fechas) {
   const r = f.rutina;
   const pctTxt = f.pct == null ? '—' : num(f.pct) + '%';
   const zona = f.pct == null ? '' : (f.pct >= 80 ? ' rut-zona-ok' : f.pct >= 50 ? ' rut-zona-medio' : ' rut-zona-bajo');
-  const celdas = f.celdas.map(c => {
+  // data-i alimenta el delay incremental de entrada del heatmap (CSS var).
+  const celdas = f.celdas.map((c, i) => {
     const cls = c.estado === 'completo' ? 'rut-cel-completo'
       : c.estado === 'parcial' ? 'rut-cel-parcial'
       : c.estado === 'vacio' ? 'rut-cel-vacio'
       : 'rut-cel-na';
-    return `<span class="rut-cel ${cls}" title="${esc(labelCorto(c.fecha))}"></span>`;
+    return `<span class="rut-cel ${cls}" style="--i:${i}" title="${esc(labelCorto(c.fecha))}"></span>`;
   }).join('');
   return `
-  <section class="rut-card rut-adh-fila${r.activa ? '' : ' rut-inactiva'}">
+  <section class="rut-card rut-adh-fila rise lively${r.activa ? '' : ' rut-inactiva'}" data-tilt>
     <header class="rut-adh-head">
       <div class="rut-rutina-titulo">
         <span class="rut-rutina-icono">${esc(r.icono || '📋')}</span>
@@ -846,10 +1090,28 @@ function bloqueAdherencia(f, fechas) {
   </section>`;
 }
 
+/* ---------- Skeletons (carga viva con shimmer) ---------- */
+function skeletonHoy() {
+  return `
+  <section class="rut-hero"><div class="shimmer" style="width:92px;height:92px;border-radius:50%"></div>
+    <div style="flex:1"><div class="shimmer" style="height:16px;width:55%;margin-bottom:10px"></div>
+      <div class="shimmer" style="height:12px;width:75%"></div></div></section>
+  ${[0, 1].map(() => `<div class="rut-card"><div class="shimmer" style="height:20px;width:40%;margin-bottom:14px"></div>
+    <div class="shimmer" style="height:56px;margin-bottom:8px"></div><div class="shimmer" style="height:56px"></div></div>`).join('')}`;
+}
+function skeletonAdh() {
+  return `
+  <section class="rut-adh-hero"><div class="shimmer" style="width:84px;height:84px;border-radius:50%"></div>
+    <div style="flex:1"><div class="shimmer" style="height:14px;width:45%;margin-bottom:10px"></div>
+      <div class="shimmer" style="height:12px;width:60%"></div></div></section>
+  ${[0, 1].map(() => `<div class="rut-card"><div class="shimmer" style="height:18px;width:35%;margin-bottom:14px"></div>
+    <div class="shimmer" style="height:18px;width:90%"></div></div>`).join('')}`;
+}
+
 /* ---------- Vacíos ---------- */
 function vacioSinRutinas() {
   return `
-  <div class="rut-vacio">
+  <div class="rut-vacio rise">
     <div class="rut-vacio-icono">☀️</div>
     <p>Todavía no tenés rutinas.</p>
     <p class="rut-vacio-sub">Andá a la pestaña Rutinas y armá tu primera (o corré el seed sql/05_rutina.sql para arrancar con «Mañana»).</p>
@@ -858,55 +1120,88 @@ function vacioSinRutinas() {
 }
 
 /* ============================================================
-   Estilos — inyectados 1 vez, prefijo rut-, solo var(--token)
+   Estilos — inyectados 1 vez, prefijo rut-, solo var(--token) + motion.css
    ============================================================ */
 const CSS = `
 .rut { max-width: 920px; margin: 0 auto; padding: var(--space-4); font-family: var(--font-ui); color: var(--text); }
 .rut * { box-sizing: border-box; }
 .rut button { font: inherit; color: inherit; cursor: pointer; }
 .rut button:focus-visible, .rut input:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
-.rut-num { font-family: var(--font-num); font-variant-numeric: tabular-nums; }
+.rut-num { font-family: var(--font-num); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.rut .v-ring-fill.rut-ring-ok { stroke: var(--ok); }
 
 /* Header + tabs */
 .rut-head { display: flex; flex-direction: column; gap: var(--space-3); margin-bottom: var(--space-4); }
 .rut-titulo { margin: 0; font-family: var(--font-display); font-size: 1.35rem; letter-spacing: .01em; }
 .rut-tabs { display: flex; gap: var(--space-2); overflow-x: auto; -webkit-overflow-scrolling: touch; }
-.rut-tab { flex: 1 1 0; min-height: 44px; padding: var(--space-2) var(--space-3); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-dim); white-space: nowrap; transition: background .15s, color .15s, border-color .15s; }
+.rut-tab { flex: 1 1 0; min-height: 44px; padding: var(--space-2) var(--space-3); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-dim); white-space: nowrap; transition: background var(--dur) ease, color var(--dur) ease, border-color var(--dur) ease; }
+.rut-tab:hover { border-color: var(--border-strong); }
 .rut-tab.activa { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
 
 /* Navegación fecha */
 .rut-fechanav { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-4); }
-.rut-nav-btn { width: 48px; min-height: 48px; flex: none; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); font-size: 1.4rem; line-height: 1; color: var(--text-dim); }
+.rut-nav-btn { width: 48px; min-height: 48px; flex: none; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); font-size: 1.4rem; line-height: 1; color: var(--text-dim); transition: background var(--dur) ease, border-color var(--dur) ease; }
+.rut-nav-btn:hover { border-color: var(--border-strong); color: var(--text); }
 .rut-nav-btn:active { background: var(--surface-2); }
 .rut-fechanav-centro { flex: 1; display: flex; flex-direction: column; align-items: center; gap: var(--space-1); min-width: 0; }
 .rut-fechanav-label { font-family: var(--font-display); font-size: 1.05rem; font-weight: 600; text-align: center; }
 .rut-chip { background: var(--accent-soft); color: var(--accent); border: none; border-radius: 999px; padding: var(--space-1) var(--space-3); font-size: .78rem; min-height: 28px; }
 
-/* Cards */
-.rut-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--space-4); margin-bottom: var(--space-4); box-shadow: var(--shadow-1); transition: border-color .2s; }
+/* Hero del día — arco de progreso + racha viva */
+.rut-hero { position: relative; display: flex; align-items: center; gap: clamp(14px, 3vw, 22px); padding: clamp(16px, 3vw, 22px); margin-bottom: var(--space-5); border-radius: var(--radius-lg); overflow: hidden;
+  background: linear-gradient(135deg, rgba(53,224,178,.07), rgba(90,162,255,.05)), var(--surface); border: 1px solid var(--border-strong); }
+.rut-hero::before { content: ""; position: absolute; width: 260px; height: 260px; left: -40px; top: -120px; border-radius: 50%; pointer-events: none;
+  background: radial-gradient(circle, rgba(53,224,178,.13), transparent 65%); animation: vida-breathe 5s ease-in-out infinite; }
+.rut-hero-fig { position: relative; width: 92px; height: 92px; flex: none; }
+.rut-hero-fig svg { width: 92px; height: 92px; transform: rotate(-90deg); }
+.rut-hero-fig-in { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; }
+.rut-hero-fig-pct { font-weight: 700; font-size: 1.4rem; line-height: 1; color: var(--accent); }
+.rut-hero-fig-sub { font-family: var(--font-num); font-size: .72rem; color: var(--text-faint); }
+.rut-hero-body { min-width: 0; position: relative; }
+.rut-hero-racha { display: flex; align-items: center; gap: var(--space-2); }
+.rut-hero-flame { font-size: 1.25rem; filter: grayscale(1) opacity(.5); transform-origin: center; }
+.rut-hero-flame.on { filter: none; }
+.rut-hero-racha-txt { font-family: var(--font-display); font-size: 1.05rem; font-weight: 700; }
+.rut-hero-racha-n { font-size: 1.5rem; color: var(--accent); margin-right: 2px; }
+.rut-hero-hint { margin: var(--space-1) 0 0; font-size: .82rem; color: var(--text-dim); }
 
-/* Rutina en Hoy — checklist con tap-targets grandes */
-.rut-rutina-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
+/* Momentos del día (secciones) */
+.rut-momento { display: flex; align-items: center; gap: var(--space-2); margin: var(--space-5) 2px var(--space-3); }
+.rut-momento-ic { font-size: 1rem; }
+.rut-momento-lbl { font-size: .7rem; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; color: var(--text-dim); }
+.rut-momento-rule { flex: 1; height: 1px; background: linear-gradient(90deg, var(--border-strong), transparent); }
+.rut-momento-n { font-size: .72rem; color: var(--text-faint); }
+
+/* Cards */
+.rut-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--space-4); margin-bottom: var(--space-4); box-shadow: var(--shadow-1); }
+
+/* Rutina en Hoy — anillo + checklist con tap-targets grandes */
+.rut-rutina-head { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-3); }
+.rut-card-fig { position: relative; width: 52px; height: 52px; flex: none; }
+.rut-card-fig svg { width: 52px; height: 52px; transform: rotate(-90deg); }
+.rut-card-fig-in { position: absolute; inset: 0; display: grid; place-items: center; font-size: .95rem; font-weight: 700; color: var(--accent); }
+.rut-completa .rut-card-fig-in { color: var(--ok); }
+.rut-rutina-info { flex: 1; min-width: 0; }
 .rut-rutina-titulo { display: flex; align-items: center; gap: var(--space-2); font-family: var(--font-display); font-size: 1.1rem; font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
 .rut-rutina-icono { font-size: 1.25rem; flex: none; }
-.rut-rutina-prog { font-size: .82rem; color: var(--text-dim); white-space: nowrap; }
-.rut-completa { border-color: var(--ok); }
+.rut-rutina-prog { font-size: .82rem; color: var(--text-dim); white-space: nowrap; margin-top: 2px; }
+.rut-completa { border-color: color-mix(in srgb, var(--ok) 55%, transparent); }
 .rut-completa .rut-rutina-prog { color: var(--ok); }
-.rut-bar { position: relative; height: 8px; background: var(--surface-2); border-radius: 999px; overflow: hidden; margin-bottom: var(--space-3); }
-.rut-bar-fill { height: 100%; border-radius: 999px; background: var(--accent); transition: width .35s ease; }
-.rut-bar-fill.rut-bar-ok { background: var(--ok); }
 .rut-items { display: flex; flex-direction: column; gap: var(--space-2); }
-.rut-item-check { display: flex; align-items: center; gap: var(--space-3); width: 100%; min-height: 60px; padding: var(--space-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); text-align: left; transition: background .12s, border-color .12s; }
+.rut-item-check { display: flex; align-items: center; gap: var(--space-3); width: 100%; min-height: 60px; padding: var(--space-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); text-align: left; transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease, transform var(--dur-fast) ease; }
 .rut-item-check:hover { border-color: var(--border-strong); }
+.rut-item-check:active { transform: scale(.99); }
 .rut-item-check.rut-on { background: var(--accent-soft); border-color: var(--accent); }
-.rut-box { width: 30px; height: 30px; flex: none; display: inline-flex; align-items: center; justify-content: center; background: var(--bg); border: 2px solid var(--border-strong); border-radius: 8px; font-size: 1.05rem; font-weight: 700; color: var(--bg); transition: background .12s, border-color .12s; }
-.rut-on .rut-box { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+.rut-box { width: 30px; height: 30px; flex: none; display: inline-flex; align-items: center; justify-content: center; background: var(--bg); border: 2px solid var(--border-strong); border-radius: 8px; transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease; }
+.rut-box-tick { font-size: 1.05rem; font-weight: 800; color: var(--bg); transform: scale(0); transition: transform var(--dur) var(--ease-spring); }
+.rut-on .rut-box { background: var(--accent); border-color: var(--accent); }
+.rut-on .rut-box-tick { transform: scale(1); }
 .rut-item-texto { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .rut-item-label { font-size: .98rem; overflow-wrap: anywhere; }
 .rut-on .rut-item-label { color: var(--text); }
 .rut-item-nota { font-size: .76rem; color: var(--text-faint); overflow-wrap: anywhere; }
 .rut-slot-vacio { padding: var(--space-3) 0; font-size: .85rem; color: var(--text-faint); }
-.rut-lanzar { width: 100%; min-height: 48px; margin-bottom: var(--space-4); background: transparent; border: 1px dashed var(--border-strong); border-radius: var(--radius); color: var(--accent-2); font-weight: 600; transition: background .15s, border-color .15s; }
+.rut-lanzar { width: 100%; min-height: 48px; margin-bottom: var(--space-4); background: transparent; border: 1px dashed var(--border-strong); border-radius: var(--radius); color: var(--accent-2); font-weight: 600; transition: background var(--dur) ease, border-color var(--dur) ease; }
 .rut-lanzar:hover, .rut-lanzar:active { background: var(--accent-2-soft); border-color: var(--accent-2); }
 
 /* Lista de rutinas */
@@ -915,36 +1210,41 @@ const CSS = `
 .rut-rlista-acciones { display: flex; gap: var(--space-1); flex: none; }
 .rut-inact-badge { font-size: .68rem; text-transform: uppercase; letter-spacing: .06em; color: var(--text-faint); background: var(--surface-2); border-radius: 999px; padding: 2px var(--space-2); vertical-align: middle; }
 .rut-inactiva { opacity: .62; }
-.rut-rlista-dias { display: flex; gap: var(--space-1); flex-wrap: wrap; margin-bottom: var(--space-2); }
+.rut-rlista-dias { display: flex; align-items: center; gap: var(--space-1); flex-wrap: wrap; margin-bottom: var(--space-2); }
 .rut-diachip { width: 26px; height: 26px; flex: none; display: inline-flex; align-items: center; justify-content: center; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; font-size: .74rem; font-weight: 600; color: var(--text-faint); }
 .rut-diachip.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 .rut-manual-badge { font-size: .76rem; color: var(--text-dim); background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: var(--space-1) var(--space-3); }
+.rut-momento-badge { font-size: .7rem; color: var(--accent-2); background: var(--accent-2-soft); border-radius: 999px; padding: 2px var(--space-2); margin-left: var(--space-1); }
 .rut-rlista-items { font-size: .82rem; color: var(--text-dim); overflow-wrap: anywhere; }
 
 /* Botones e íconos */
-.rut-btn-primario { min-height: 48px; padding: var(--space-2) var(--space-4); background: var(--accent); border: none; border-radius: var(--radius); color: var(--bg); font-weight: 700; transition: opacity .15s; }
+.rut-btn-primario { min-height: 48px; padding: var(--space-2) var(--space-4); background: var(--accent); border: none; border-radius: var(--radius); color: var(--bg); font-weight: 700; transition: opacity var(--dur) ease, transform var(--dur-fast) ease; }
 .rut-btn-primario:hover { opacity: .9; }
-.rut-btn-ghost { min-height: 44px; padding: var(--space-2) var(--space-4); background: transparent; border: 1px solid var(--border-strong); border-radius: var(--radius); color: var(--text-dim); font-weight: 600; transition: background .15s, color .15s; }
+.rut-btn-primario:active { transform: scale(.98); }
+.rut-btn-ghost { min-height: 44px; padding: var(--space-2) var(--space-4); background: transparent; border: 1px solid var(--border-strong); border-radius: var(--radius); color: var(--text-dim); font-weight: 600; transition: background var(--dur) ease, color var(--dur) ease; }
 .rut-btn-ghost:hover { background: var(--surface-2); color: var(--text); }
-.rut-icono { width: 44px; min-height: 44px; flex: none; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: none; border-radius: var(--radius); color: var(--text-faint); font-size: 1rem; }
+.rut-icono { width: 44px; min-height: 44px; flex: none; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: none; border-radius: var(--radius); color: var(--text-faint); font-size: 1rem; transition: background var(--dur-fast) ease, color var(--dur-fast) ease; }
 .rut-icono:hover { background: var(--surface-2); color: var(--text-dim); }
 .rut-icono:disabled { opacity: .3; cursor: default; }
 .rut-icono.rut-borrar:hover, .rut-icono.rut-borrar:active { color: var(--danger); }
 
 /* Inputs */
-.rut-input { width: 100%; min-height: 44px; padding: var(--space-2) var(--space-3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); font: inherit; }
+.rut-input { width: 100%; min-height: 44px; padding: var(--space-2) var(--space-3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); font: inherit; transition: border-color var(--dur) ease; }
 .rut-input:focus { border-color: var(--accent); outline: none; }
 .rut-input-nota { min-height: 40px; font-size: .85rem; }
 
-/* Modal (editor / lanzar) */
-.rut-modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-end; justify-content: center; background: color-mix(in srgb, var(--bg) 75%, transparent); backdrop-filter: blur(2px); }
-.rut-modal-card { width: 100%; max-width: 520px; max-height: 88vh; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-lg) var(--radius-lg) 0 0; padding: var(--space-4); box-shadow: var(--shadow-2); }
+/* Modal (editor / lanzar) — glass */
+.rut-modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-end; justify-content: center; background: color-mix(in srgb, var(--bg) 68%, transparent); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); animation: rut-fade var(--dur) ease; }
+.rut-modal-card { width: 100%; max-width: 520px; max-height: 88vh; display: flex; flex-direction: column; background: color-mix(in srgb, var(--surface) 92%, transparent); border: 1px solid var(--border-strong); border-radius: var(--radius-lg) var(--radius-lg) 0 0; padding: var(--space-4); box-shadow: var(--shadow-2); animation: rut-rise var(--dur-slow) var(--ease-out-expo); }
+@keyframes rut-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes rut-rise { from { transform: translateY(24px); opacity: 0; } to { transform: none; opacity: 1; } }
 .rut-modal-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); margin-bottom: var(--space-3); }
 .rut-modal-titulo { margin: 0; font-family: var(--font-display); font-size: 1.05rem; }
 .rut-modal-body { flex: 1; overflow-y: auto; }
 .rut-picker-vacio { padding: var(--space-4); text-align: center; font-size: .84rem; color: var(--text-faint); }
-.rut-lista-item { display: flex; align-items: center; gap: var(--space-3); width: 100%; min-height: 56px; padding: var(--space-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: var(--space-2); text-align: left; transition: border-color .12s; }
+.rut-lista-item { display: flex; align-items: center; gap: var(--space-3); width: 100%; min-height: 56px; padding: var(--space-3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: var(--space-2); text-align: left; transition: border-color var(--dur-fast) ease, transform var(--dur-fast) ease; }
 .rut-lista-item:hover { border-color: var(--accent-2); }
+.rut-lista-item:active { transform: scale(.99); }
 .rut-lista-nombre { flex: 1; min-width: 0; font-size: .95rem; overflow-wrap: anywhere; }
 .rut-lista-meta { font-size: .76rem; color: var(--text-faint); white-space: nowrap; }
 
@@ -957,7 +1257,7 @@ const CSS = `
 .rut-ed-grupo-label { font-size: .78rem; color: var(--text-dim); margin-bottom: var(--space-2); }
 .rut-ed-hint { color: var(--text-faint); font-size: .72rem; }
 .rut-diachips { display: flex; gap: var(--space-2); flex-wrap: wrap; }
-.rut-diachip-btn { width: 40px; height: 40px; cursor: pointer; transition: background .12s, border-color .12s, color .12s; }
+.rut-diachip-btn { width: 40px; height: 40px; cursor: pointer; transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease, color var(--dur-fast) ease; }
 .rut-diachip-btn:hover { border-color: var(--border-strong); }
 .rut-ed-items { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-2); }
 .rut-ed-item { display: flex; gap: var(--space-2); align-items: flex-start; }
@@ -970,29 +1270,49 @@ const CSS = `
 
 /* Adherencia */
 .rut-adh-toggle { display: flex; gap: var(--space-2); margin-bottom: var(--space-4); }
-.rut-seg { flex: 1; min-height: 44px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-dim); font-weight: 600; transition: background .15s, color .15s, border-color .15s; }
+.rut-seg { flex: 1; min-height: 44px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-dim); font-weight: 600; transition: background var(--dur) ease, color var(--dur) ease, border-color var(--dur) ease; }
+.rut-seg:hover { border-color: var(--border-strong); }
 .rut-seg.activa { background: var(--accent-2-soft); border-color: var(--accent-2); color: var(--accent-2); }
+
+/* Adherencia — hero de resumen */
+.rut-adh-hero { position: relative; display: flex; align-items: center; gap: clamp(14px, 3vw, 20px); padding: clamp(14px, 3vw, 20px); margin-bottom: var(--space-5); border-radius: var(--radius-lg); overflow: hidden;
+  background: linear-gradient(135deg, rgba(90,162,255,.07), rgba(53,224,178,.05)), var(--surface); border: 1px solid var(--border-strong); }
+.rut-adh-hero-fig { position: relative; width: 84px; height: 84px; flex: none; }
+.rut-adh-hero-fig svg { width: 84px; height: 84px; transform: rotate(-90deg); }
+.rut-adh-hero-fig .v-ring-fill { stroke: var(--accent-2); }
+.rut-adh-hero-pct { position: absolute; inset: 0; display: grid; place-items: center; font-weight: 700; font-size: 1.3rem; color: var(--accent-2); }
+.rut-adh-hero-body { min-width: 0; }
+.rut-adh-hero-lbl { font-size: .7rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; color: var(--text-faint); }
+.rut-adh-hero-racha { display: flex; align-items: center; gap: var(--space-2); margin-top: var(--space-2); font-family: var(--font-display); font-size: 1rem; font-weight: 700; }
+
 .rut-adh-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
 .rut-adh-pct { font-size: 1.35rem; font-weight: 700; white-space: nowrap; }
 .rut-zona-ok { color: var(--ok); }
 .rut-zona-medio { color: var(--warn); }
 .rut-zona-bajo { color: var(--danger); }
 .rut-adh-grid { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: var(--space-3); }
-.rut-cel { width: 16px; height: 16px; flex: none; border-radius: 4px; border: 1px solid var(--border); }
-.rut-cel-completo { background: var(--ok); border-color: var(--ok); }
-.rut-cel-parcial { background: color-mix(in srgb, var(--warn) 55%, transparent); border-color: color-mix(in srgb, var(--warn) 70%, transparent); }
-.rut-cel-vacio { background: color-mix(in srgb, var(--danger) 30%, transparent); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+.rut-cel { width: 16px; height: 16px; flex: none; border-radius: 4px; border: 1px solid var(--border); animation: rut-cel-in var(--dur) var(--ease-spring) backwards; animation-delay: calc(var(--i, 0) * 22ms); }
+@keyframes rut-cel-in { from { opacity: 0; transform: scale(.4); } to { opacity: 1; transform: scale(1); } }
+.rut-cel-completo { background: var(--ok); border-color: var(--ok); box-shadow: 0 0 6px color-mix(in srgb, var(--ok) 45%, transparent); }
+.rut-cel-parcial { background: color-mix(in srgb, var(--warn) 60%, transparent); border-color: color-mix(in srgb, var(--warn) 75%, transparent); }
+.rut-cel-vacio { background: color-mix(in srgb, var(--danger) 26%, transparent); border-color: color-mix(in srgb, var(--danger) 42%, transparent); }
 .rut-cel-na { background: var(--surface-2); border-color: var(--border); opacity: .5; }
 .rut-adh-pie { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; font-size: .8rem; color: var(--text-dim); }
 .rut-adh-rango-txt { color: var(--text-faint); font-family: var(--font-num); }
 
-/* Vacíos y cargando */
+/* Vacíos */
 .rut-vacio { padding: var(--space-8) var(--space-4); text-align: center; color: var(--text-dim); }
 .rut-vacio-icono { font-size: 2.2rem; margin-bottom: var(--space-3); }
 .rut-vacio p { margin: 0 0 var(--space-2); }
 .rut-vacio-sub { font-size: .82rem; color: var(--text-faint); }
 .rut-vacio .rut-btn-primario, .rut-vacio .rut-lanzar { margin-top: var(--space-3); display: inline-block; width: auto; padding-left: var(--space-6); padding-right: var(--space-6); }
-.rut-cargando { padding: var(--space-8) var(--space-4); text-align: center; color: var(--text-faint); font-size: .9rem; }
+
+/* Reduced-motion: neutraliza los keyframes propios de este módulo */
+@media (prefers-reduced-motion: reduce) {
+  .rut-hero::before { animation: none !important; }
+  .rut-modal, .rut-modal-card, .rut-cel { animation: none !important; }
+  .rut-box-tick { transition: none !important; }
+}
 
 /* Desktop */
 @media (min-width: 768px) {
@@ -1028,6 +1348,7 @@ export default {
     S.editor = null;
     S.lanzarModal = false;
     S.lanzadas = {};
+    S._firma = null; // fuerza coreografía de entrada en el primer paint del mount
     inyectarEstilos();
     bind();
     if (!supabase) {
@@ -1041,7 +1362,7 @@ export default {
       </div>`;
       return;
     }
-    container.innerHTML = `<div class="rut"><div class="rut-cargando">Cargando Rutina…</div></div>`;
+    container.innerHTML = `<div class="rut"><div class="rut-cuerpo">${skeletonHoy()}</div></div>`;
     try {
       await Promise.all([cargarRutinas(), cargarChecks()]);
       S.ultimaCarga = Date.now();
@@ -1054,6 +1375,10 @@ export default {
   render() {
     if (!S.container) return;
     if (!supabase) return;
+    // Al volver de otra ruta queremos que la vista "reviva": forzar la
+    // coreografía de entrada en este paint (los toggles internos, que llaman
+    // paint() directo, siguen asentando sin re-animar).
+    S._firma = null;
     // Si cambió el día real desde la última visita, reenganchar "hoy" SIN
     // mostrar los checks del día viejo bajo el label nuevo mientras recarga.
     if (S.tab === 'hoy' && S.fecha !== hoyStr() && Date.now() - S.ultimaCarga > 6 * 60 * 60 * 1000) {

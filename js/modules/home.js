@@ -16,6 +16,7 @@
 import { supabase } from '../core/supabase.js';
 import { getConfig } from '../core/config.js';
 import { navigate } from '../core/router.js';
+import { toast } from '../core/ui.js';
 import { calcularPalancas, pulsoVida, dominiosDe } from '../core/palancas.js';
 import { countUp, ring, stagger, tiltAll } from '../core/anim.js';
 
@@ -357,6 +358,18 @@ function tileHtml(t) {
     </button>`;
 }
 
+// Arma los data-attrs de una acción de palanca (para el 1-tap o la navegación).
+function accionAttrs(accion) {
+  if (!accion) return '';
+  const p = accion.params || {};
+  let a = `data-pal-accion data-modulo="${esc(accion.modulo)}"`;
+  if (p.tipo) a += ` data-tipo="${esc(p.tipo)}"`;
+  if (p.rutina_id) a += ` data-rutina="${esc(p.rutina_id)}"`;
+  if (p.item_id) a += ` data-item="${esc(p.item_id)}"`;
+  if (p.fecha) a += ` data-fecha="${esc(p.fecha)}"`;
+  return a;
+}
+
 function crossHtml(cruza) {
   const nodes = dominiosDe(cruza);
   if (!nodes.length) return '';
@@ -371,11 +384,11 @@ function leverHtml(p) {
       <div class="hom-tarea ${t.hecho ? 'hom-tarea-ok' : ''}">
         <span class="hom-tarea-mark">${t.hecho ? '✓' : '○'}</span>
         <span class="hom-tarea-lbl">${esc(t.label)}</span>
-        ${t.accion ? `<button type="button" class="hom-mini" data-pal-accion data-modulo="${esc(t.accion.modulo)}">${esc(t.accion.label)}</button>` : ''}
+        ${t.accion ? `<button type="button" class="hom-mini" ${accionAttrs(t.accion)}>${esc(t.accion.label)}</button>` : ''}
       </div>`).join('')}</div>` : '';
   const accion = p.accion ? `
     <div class="hom-lever-foot">
-      <button type="button" class="hom-act" data-pal-accion data-modulo="${esc(p.accion.modulo)}">${esc(p.accion.label)}
+      <button type="button" class="hom-act" ${accionAttrs(p.accion)}>${esc(p.accion.label)}
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
       </button>
     </div>` : '';
@@ -492,10 +505,27 @@ function onClick(e) {
   if (nav && S.container.contains(nav)) { navigate(nav.dataset.nav); return; }
   const acc = e.target.closest('[data-pal-accion]');
   if (acc && S.container.contains(acc)) {
-    const modulo = acc.dataset.modulo;
-    // Ola 1: la acción navega al módulo destino. El 1-tap inline (tildar/insertar
-    // sin salir del Home) es un refinamiento posterior (BACKLOG.md §6 paso 4).
-    if (modulo) navigate(modulo);
+    // 1-tap real: si la acción es tildar un check (ej. creatina), lo insertamos
+    // sin salir del Home. El resto de acciones navegan al módulo destino.
+    if (acc.dataset.tipo === 'check' && acc.dataset.rutina && acc.dataset.item) {
+      tildarCheck(acc.dataset.rutina, acc.dataset.item, acc.dataset.fecha);
+      return;
+    }
+    if (acc.dataset.modulo) navigate(acc.dataset.modulo);
+  }
+}
+
+// Tilda un ítem de rutina (ej. creatina) directo desde el Home, sin navegar.
+async function tildarCheck(rutinaId, itemId, fecha) {
+  if (!supabase || !S.userId || !rutinaId || !itemId) { navigate('rutina'); return; }
+  try {
+    const { error } = await supabase.from('rutina_checks')
+      .insert({ user_id: S.userId, fecha: fecha || hoyStr(), rutina_id: rutinaId, item_id: itemId });
+    if (error) throw error;
+    toast('Listo, tildado ✓', 'success');
+    montar(); // recarga el cockpit → la palanca cumplida desaparece
+  } catch (err) {
+    toast('No se pudo tildar: ' + (err && err.message ? err.message : 'error'), 'error');
   }
 }
 

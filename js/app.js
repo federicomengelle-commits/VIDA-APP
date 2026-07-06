@@ -129,12 +129,10 @@ function renderLogin() {
 /* ---------- Shell logueado ---------- */
 function navItemHtml(m) {
   const disabled = m.enabled ? '' : 'data-disabled';
-  const fase = m.enabled ? '' : `<span class="vida-fase">${esc(FASES[m.id] || 'Pronto')}</span>`;
   return `
     <button type="button" class="vida-nav-item" data-id="${esc(m.id)}" ${disabled}>
       <span class="vida-nav-ic" aria-hidden="true">${m.icon}</span>
-      <span>${esc(m.label)}</span>
-      ${fase}
+      <span class="vida-nav-lbl">${esc(m.label)}</span>
     </button>`;
 }
 
@@ -144,20 +142,21 @@ function renderShell(user) {
 
   app.innerHTML = `
     <div class="vida-shell">
-      <header class="vida-topbar">
-        <span class="vida-logo vida-logo-sm">VIDA</span>
-        <button type="button" class="btn btn-ghost" data-logout>Salir</button>
-      </header>
-      <nav class="vida-sidenav" aria-label="Módulos">
-        <div class="vida-brand-side"><span class="vida-logo vida-logo-sm">VIDA</span></div>
-        <div class="vida-nav-list">${items}</div>
-        <div class="vida-side-foot">
-          <span class="vida-user" title="${email}">${email}</span>
-          <button type="button" class="btn btn-ghost" data-logout>Salir</button>
+      <header class="vida-topnav">
+        <div class="vida-topnav-inner">
+          <span class="vida-logo vida-logo-sm">VIDA</span>
+          <nav class="vida-nav" aria-label="Módulos">
+            <div class="vida-nav-ind" aria-hidden="true"></div>
+            ${items}
+          </nav>
+          <div class="vida-topnav-right">
+            <span class="vida-user" title="${email}">${email}</span>
+            <button type="button" class="btn btn-ghost" data-logout>Salir</button>
+          </div>
         </div>
-      </nav>
+      </header>
       <main id="mainContent"></main>
-      <nav class="vida-bottomnav" aria-label="Módulos">${items}</nav>
+      <nav class="vida-dock" aria-label="Módulos">${items}</nav>
     </div>`;
 
   const shell = app.querySelector('.vida-shell');
@@ -188,12 +187,30 @@ function renderShell(user) {
   });
 }
 
-/* ---------- Resaltado del ítem activo ---------- */
+/* ---------- Resaltado del ítem activo + indicador deslizante ---------- */
+function moverIndicador(id) {
+  const nav = document.querySelector('.vida-topnav .vida-nav');
+  if (!nav) return;
+  const ind = nav.querySelector('.vida-nav-ind');
+  const item = nav.querySelector(`.vida-nav-item[data-id="${id}"]`);
+  if (!ind) return;
+  if (!item) { ind.style.opacity = '0'; return; }
+  ind.style.width = item.offsetWidth + 'px';
+  ind.style.transform = 'translateX(' + item.offsetLeft + 'px)';
+  ind.style.opacity = '1';
+}
+
 window.addEventListener('vida:route', (e) => {
   const id = e.detail?.id;
   document.querySelectorAll('.vida-nav-item').forEach((el) => {
     el.classList.toggle('active', el.dataset.id === id);
   });
+  requestAnimationFrame(() => moverIndicador(id));
+});
+
+window.addEventListener('resize', () => {
+  const active = document.querySelector('.vida-topnav .vida-nav-item.active');
+  if (active) moverIndicador(active.dataset.id);
 });
 
 /* ---------- Entrada a la app ---------- */

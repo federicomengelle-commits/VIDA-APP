@@ -357,62 +357,78 @@ code {
   50% { opacity: 0.35; }
 }
 
-/* ---------- Shell logueado ---------- */
-.vida-shell {
-  display: grid;
-  grid-template-columns: var(--sidebar-w) 1fr;
-  min-height: 100dvh;
-}
+/* ---------- Shell logueado: top-nav premium (desktop) + dock (mobile) ---------- */
+.vida-shell { min-height: 100dvh; display: flex; flex-direction: column; }
 
-.vida-sidenav {
+.vida-topnav {
   position: sticky;
   top: 0;
-  height: 100dvh;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-6) var(--space-4);
-  background: var(--surface);
-  border-right: 1px solid var(--border);
+  z-index: 50;
+  background: rgba(8, 11, 10, 0.72);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--border);
 }
-.vida-brand-side { padding: 0 var(--space-3) var(--space-6); }
-.vida-nav-list { display: flex; flex-direction: column; gap: var(--space-1); }
-
-.vida-nav-item {
+.vida-topnav-inner {
   display: flex;
   align-items: center;
-  gap: var(--space-3);
-  width: 100%;
-  padding: 10px var(--space-3);
+  gap: var(--space-5);
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: var(--space-3) var(--space-6);
+  padding-top: calc(var(--space-3) + env(safe-area-inset-top, 0px));
+}
+
+.vida-nav {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: 1;
+  min-width: 0;
+}
+/* Indicador deslizante (lo posiciona app.js según el ítem activo) */
+.vida-nav-ind {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px rgba(53, 224, 178, 0.18);
+  opacity: 0;
+  pointer-events: none;
+  transition: transform var(--dur) var(--ease-out-expo),
+              width var(--dur) var(--ease-out-expo),
+              opacity var(--dur) ease;
+}
+
+.vida-nav-item {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 9px var(--space-3);
   border-radius: var(--radius);
   color: var(--text-dim);
   font-weight: 600;
   font-size: 14px;
-  text-align: left;
-  transition: background 0.15s ease, color 0.15s ease;
+  white-space: nowrap;
+  transition: color var(--dur) ease, background var(--dur) ease;
 }
-.vida-nav-item:hover:not([data-disabled]) { background: var(--surface-2); color: var(--text); }
-.vida-nav-item.active { background: var(--accent-soft); color: var(--accent); }
+.vida-nav-item:hover:not([data-disabled]):not(.active) { background: var(--surface-2); color: var(--text); }
+.vida-nav-item.active { color: var(--accent); }
 .vida-nav-item[data-disabled] { opacity: 0.4; cursor: default; }
 .vida-nav-ic { flex: none; font-size: 17px; line-height: 1; }
-.vida-fase {
-  margin-left: auto;
-  color: var(--text-faint);
-  font-family: var(--font-num);
-  font-size: 10px;
-  letter-spacing: 0.04em;
-}
+.vida-nav-lbl { line-height: 1; }
+.vida-fase { display: none; }
 
-.vida-side-foot {
-  margin-top: auto;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
+.vida-topnav-right { display: flex; align-items: center; gap: var(--space-3); flex: none; }
 .vida-user {
-  padding: 0 var(--space-2);
   color: var(--text-faint);
   font-size: 12px;
+  max-width: 160px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -420,67 +436,57 @@ code {
 
 #mainContent {
   width: 100%;
-  max-width: 1080px;
+  max-width: 1120px;
   margin: 0 auto;
   padding: var(--space-6);
 }
 
-.vida-topbar { display: none; }
-.vida-bottomnav { display: none; }
+.vida-dock { display: none; }
 
-/* ---------- Mobile (<768px): topbar + bottom nav fijo ---------- */
+/* ---------- Mobile (<768px): top-nav se reduce + dock flotante ---------- */
 @media (max-width: 767px) {
-  .vida-shell { grid-template-columns: 1fr; }
-  .vida-sidenav { display: none; }
-
-  .vida-topbar {
-    position: sticky;
-    top: 0;
-    z-index: 40;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
+  .vida-topnav-inner {
+    gap: var(--space-3);
     padding: var(--space-2) var(--space-4);
     padding-top: calc(var(--space-2) + env(safe-area-inset-top, 0px));
-    background: rgba(8, 11, 10, 0.85);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border-bottom: 1px solid var(--border);
   }
-  .vida-topbar .btn { min-height: 34px; padding: var(--space-1) var(--space-3); font-size: 13px; }
-
-  .vida-bottomnav {
-    position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    z-index: 40;
-    display: flex;
-    justify-content: space-around;
-    padding: var(--space-1) var(--space-2);
-    padding-bottom: calc(var(--space-1) + env(safe-area-inset-bottom, 0px));
-    background: rgba(8, 11, 10, 0.92);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border-top: 1px solid var(--border);
-  }
-  .vida-bottomnav .vida-nav-item {
-    flex: 1;
-    flex-direction: column;
-    gap: 2px;
-    padding: var(--space-1) var(--space-1) var(--space-2);
-    font-size: 10px;
-    font-weight: 700;
-    text-align: center;
-    align-items: center;
-    border-radius: var(--radius-sm);
-  }
-  .vida-bottomnav .vida-nav-ic { font-size: 21px; }
-  .vida-bottomnav .vida-fase { display: none; }
-  .vida-bottomnav .vida-nav-item.active { background: transparent; }
+  .vida-nav { display: none; }
+  .vida-topnav-right { margin-left: auto; }
+  .vida-topnav-right .vida-user { display: none; }
+  .vida-topnav-right .btn { min-height: 34px; padding: var(--space-1) var(--space-3); font-size: 13px; }
 
   #mainContent {
     padding: var(--space-4);
-    padding-bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+    padding-bottom: calc(96px + env(safe-area-inset-bottom, 0px));
   }
+
+  .vida-dock {
+    position: fixed;
+    left: 50%;
+    bottom: 12px;
+    transform: translateX(-50%);
+    z-index: 50;
+    display: flex;
+    gap: 2px;
+    padding: 6px;
+    border-radius: 999px;
+    background: rgba(14, 20, 18, 0.82);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--border-strong);
+    box-shadow: var(--shadow-2);
+    max-width: calc(100vw - 24px);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .vida-dock::-webkit-scrollbar { display: none; }
+  .vida-dock .vida-nav-item {
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 10px;
+    border-radius: 999px;
+  }
+  .vida-dock .vida-nav-lbl { font-size: 9px; font-weight: 700; }
+  .vida-dock .vida-nav-ic { font-size: 20px; }
+  .vida-dock .vida-nav-item.active { background: var(--accent-soft); color: var(--accent); }
 }

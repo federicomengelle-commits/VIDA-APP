@@ -1,8 +1,14 @@
-// VIDA — Módulo Plata (Fase 2)
-// Captura rápida de movimientos · Resumen del mes · Objetivos
-// Contrato: docs/CONTRATOS.md §4 y §9. Roadmap: CLAUDE.md §4 (Fase 2).
+// VIDA — Módulo Plata (Fase 2 · re-skin "Instrumento Vivo")
+// Panorama (dashboard vivo) · Captura rápida de movimientos · Resumen · Objetivos
+// Contrato: docs/CONTRATOS.md §4 y §9. Roadmap: CLAUDE.md §4 (Fase 2), BACKLOG.md §2.
+//
+// RE-SKIN, no rewrite: la capa de datos (queries, inserts/deletes soft, estado S,
+// guards de carrera/doble-tap, config desde user_config) queda INTACTA. Solo se
+// rediseñan las funciones de pintado y se agrega el tab Panorama, que deriva TODO
+// de lo que el módulo ya calcula (resumenMes / movimientos). Sin tablas ni SQL.
 import { supabase } from '../core/supabase.js';
 import { toast, confirmDialog } from '../core/ui.js';
+import { countUp, ring, stagger, tiltAll } from '../core/anim.js';
 
 /* ============================================================
    Fechas — helpers locales (YYYY-MM-DD local del dispositivo)
@@ -73,9 +79,11 @@ const S = {
   userId: null,
   config: null,
   boundEl: null,           // container atado a los listeners (si cambia, se re-bindea)
-  tab: 'mes',              // 'mes' | 'resumen' | 'objetivos'
+  tab: 'panorama',         // 'panorama' | 'mes' | 'resumen' | 'objetivos'
   mes: mesActual(),        // primer día del mes visible (YYYY-MM-01)
   movimientos: [],         // plata_movimientos del mes visible
+  movimientosPrev: null,   // { mes, rows } → mes anterior al visible (cache p/ delta del Panorama)
+  cargandoPrev: false,     // in-flight del fetch del mes anterior
   objetivos: [],           // plata_objetivos activos (no borrados)
   objetivosCargados: false, // distingue "nunca cargado" de "cargado y vacío"
   aportesObjetivos: [],    // movimientos con objetivo_id (todas las fechas) → progreso
@@ -144,6 +152,32 @@ async function cargarMovimientos() {
   if (mes !== S.mes) return false;
   S.movimientos = data || [];
   return true;
+}
+
+// Mes anterior al visible — SOLO lectura, para el delta del Panorama. Tolerante:
+// si falla, deja el cache vacío y el Panorama muestra el mes sin comparación.
+// No toca S.movimientos (que pertenece al mes visible). Cachea por mes.
+async function cargarMesAnterior() {
+  const mesPrev = addMeses(S.mes, -1);
+  if (S.cargandoPrev) return;
+  if (S.movimientosPrev && S.movimientosPrev.mes === mesPrev) return; // ya cacheado
+  S.cargandoPrev = true;
+  try {
+    const desde = mesPrev;
+    const hasta = ultimoDiaMes(mesPrev);
+    const { data, error } = await supabase.from('plata_movimientos')
+      .select('tipo, monto, moneda, categoria, descripcion, objetivo_id')
+      .eq('user_id', S.userId).eq('_deleted', false)
+      .gte('fecha', desde).lte('fecha', hasta);
+    if (error) throw error;
+    if (addMeses(S.mes, -1) !== mesPrev) return; // el usuario ya navegó a otro mes
+    S.movimientosPrev = { mes: mesPrev, rows: data || [] };
+  } catch (_) {
+    // Silencioso: el delta es una mejora, no un requisito. Marca "sin comparación".
+    S.movimientosPrev = { mes: mesPrev, rows: null };
+  } finally {
+    S.cargandoPrev = false;
+  }
 }
 
 async function cargarObjetivos() {
@@ -229,6 +263,142 @@ function resumenMes() {
       aportado: aportes.get(mon) || 0,
     };
   });
+}
+
+/* ---------- Derivados del Panorama (dashboard) — TODO desde datos ya cargados ---------- */
+
+// Agrega una lista cruda de movimientos por moneda: ingreso/egreso/balance,
+// egresos por categoría (ordenados), y el total de egresos individuales para el
+// waterfall. Es la MISMA lógica que resumenMes pero sobre un array arbitrario,
+// para poder aplicarla también al mes anterior (cache) sin duplicar reglas.
+function agregarPorMoneda(rows) {
+  const monedas = new Map(); // mon → { ingreso, egreso }
+  const cats = new Map();    // mon → Map(categoria → egreso)
+  for (const m of (rows || [])) {
+    const mon = String(m.moneda || '').toUpperCase();
+    const monto = Number(m.monto) || 0;
+    const esIngreso = m.tipo === 'ingreso';
+    if (!monedas.has(mon)) monedas.set(mon, { ingreso: 0, egreso: 0 });
+    const mm = monedas.get(mon);
+    if (esIngreso) mm.ingreso += monto; else mm.egreso += monto;
+    if (!esIngreso) {
+      if (!cats.has(mon)) cats.set(mon, new Map());
+      const c = (m.categoria && String(m.categoria).trim()) || 'Sin categoría';
+      const cm = cats.get(mon);
+      cm.set(c, (cm.get(c) || 0) + monto);
+    }
+  }
+  const out = new Map();
+  for (const [mon, mm] of monedas) {
+    const catMap = cats.get(mon) || new Map();
+    const catsArr = [...catMap.entries()]
+      .map(([categoria, egreso]) => ({ categoria, egreso }))
+      .sort((a, b) => b.egreso - a.egreso);
+    out.set(mon, {
+      moneda: mon,
+      ingreso: mm.ingreso,
+      egreso: mm.egreso,
+      balance: mm.ingreso - mm.egreso,
+      movimiento: mm.ingreso + mm.egreso,
+      categorias: catsArr,
+    });
+  }
+  return out;
+}
+
+// Elige la moneda "principal" = la de mayor movimiento total (ingreso+egreso).
+function monedaPrincipalDe(agg) {
+  let principal = null, max = -1;
+  for (const [mon, b] of agg) {
+    if (b.movimiento > max) { max = b.movimiento; principal = mon; }
+  }
+  return principal;
+}
+
+// Arma todo el estado de vista del Panorama a partir de S.movimientos (mes visible)
+// y del cache del mes anterior (para deltas). Puro: no toca Supabase.
+function datosPanorama() {
+  const agg = agregarPorMoneda(S.movimientos);
+  const principal = monedaPrincipalDe(agg);
+  const prevRows = S.movimientosPrev && S.movimientosPrev.rows; // null = sin comparación
+  const aggPrev = prevRows ? agregarPorMoneda(prevRows) : null;
+
+  // Tiles de balance por moneda (todas las monedas del mes, principal primero).
+  const monedas = [...agg.keys()].sort((a, b) =>
+    (a === principal ? -1 : b === principal ? 1 : agg.get(b).movimiento - agg.get(a).movimiento));
+
+  const bp = principal ? agg.get(principal) : null;
+  const bpPrev = (aggPrev && principal && aggPrev.has(principal)) ? aggPrev.get(principal) : null;
+
+  // Delta % del balance vs. mes anterior (misma moneda principal). null si no hay base.
+  const deltaBalance = deltaPct(bp ? bp.balance : null, bpPrev ? bpPrev.balance : null);
+  const deltaGasto = deltaPct(bp ? bp.egreso : null, bpPrev ? bpPrev.egreso : null);
+
+  // Top 3 egresos individuales del mes (moneda principal), para el tile de gastos.
+  const topGastos = principal ? S.movimientos
+    .filter(m => m.tipo === 'egreso' && String(m.moneda || '').toUpperCase() === principal)
+    .map(m => ({
+      titulo: (m.categoria && String(m.categoria).trim()) || 'Egreso',
+      sub: (m.descripcion && String(m.descripcion).trim()) || labelAmbito(m.ambito),
+      monto: Number(m.monto) || 0, moneda: principal,
+    }))
+    .sort((a, b) => b.monto - a.monto)
+    .slice(0, 3) : [];
+
+  return {
+    hayDatos: !!bp,
+    principal,
+    balance: bp ? bp.balance : 0,
+    ingreso: bp ? bp.ingreso : 0,
+    egreso: bp ? bp.egreso : 0,
+    deltaBalance,
+    deltaGasto,
+    egresoPrev: bpPrev ? bpPrev.egreso : null,
+    sinComparacion: prevRows === null || prevRows === undefined,
+    tiles: monedas.map(mon => {
+      const b = agg.get(mon);
+      return { moneda: mon, balance: b.balance, ingreso: b.ingreso, egreso: b.egreso };
+    }),
+    waterfall: bp ? construirWaterfall(bp) : null,
+    topGastos,
+  };
+}
+
+// Delta porcentual firmado de `actual` vs `prev`. null cuando no hay comparación posible.
+function deltaPct(actual, prev) {
+  if (actual == null || prev == null) return null;
+  if (Math.abs(prev) < 0.0000001) return null; // sin base (mes anterior en 0) → no forzar %
+  return ((actual - prev) / Math.abs(prev)) * 100;
+}
+
+// Waterfall del cashflow del mes: saldo 0 → +ingresos → −egresos (por categoría, top 5
+// + "otros") → balance. Devuelve pasos con acumulado para dibujar barras flotantes.
+function construirWaterfall(b) {
+  const pasos = [];
+  let acum = 0;
+  pasos.push({ tipo: 'base', label: 'Inicio', delta: 0, desde: 0, hasta: 0 });
+  // Ingresos (un solo bloque hacia arriba).
+  const desdeIng = acum; acum += b.ingreso;
+  pasos.push({ tipo: 'ingreso', label: 'Ingresos', delta: b.ingreso, desde: desdeIng, hasta: acum });
+  // Egresos por categoría (top 5, resto agrupado), cada uno baja el acumulado.
+  const TOP = 5;
+  const top = b.categorias.slice(0, TOP);
+  const resto = b.categorias.slice(TOP);
+  const restoTotal = resto.reduce((s, c) => s + c.egreso, 0);
+  for (const c of top) {
+    const desde = acum; acum -= c.egreso;
+    pasos.push({ tipo: 'egreso', label: c.categoria, delta: -c.egreso, desde, hasta: acum });
+  }
+  if (restoTotal > 0) {
+    const desde = acum; acum -= restoTotal;
+    pasos.push({ tipo: 'egreso', label: 'Otros', delta: -restoTotal, desde, hasta: acum });
+  }
+  // Balance final (barra sólida desde 0).
+  pasos.push({ tipo: 'balance', label: 'Balance', delta: acum, desde: 0, hasta: acum });
+  const valores = pasos.flatMap(p => [p.desde, p.hasta]);
+  const min = Math.min(0, ...valores);
+  const max = Math.max(0, ...valores);
+  return { pasos, min, max, moneda: b.moneda };
 }
 
 // Progreso de un objetivo = suma de movimientos (no borrados) con su objetivo_id
@@ -440,6 +610,7 @@ async function aportarObjetivo(datos) {
 async function cambiarMes(mes) {
   S.mes = mes;
   S.cargando = true;
+  S.movimientosPrev = null; // el mes anterior cacheado ya no corresponde al nuevo mes visible
   paint();
   try {
     if (!(await cargarMovimientos())) return; // llegó tarde: otra navegación se hizo cargo
@@ -450,6 +621,8 @@ async function cambiarMes(mes) {
   }
   S.cargando = false;
   paint();
+  // Si estamos en Panorama, traer el nuevo mes anterior para el delta.
+  if (S.tab === 'panorama') asegurarMesAnterior();
 }
 
 function enfocarMonto() {
@@ -499,6 +672,8 @@ function onClick(e) {
     if (S.tab === 'objetivos' && !S.objetivosCargados && !S.cargandoObjetivos) {
       cargarObjetivosLazy();
     }
+    // Panorama necesita el mes anterior para el delta → carga tolerante en background.
+    if (S.tab === 'panorama') asegurarMesAnterior();
     paint();
     return;
   }
@@ -614,14 +789,28 @@ async function cargarObjetivosLazy() {
   paint();
 }
 
+// Carga el mes anterior (para el delta del Panorama) sin bloquear: si ya está
+// cacheado no hace nada; cuando llega, repinta solo si seguimos en Panorama y en
+// el mismo mes visible (el delta pasa de "—" a "▲/▼ %").
+function asegurarMesAnterior() {
+  const mesPrev = addMeses(S.mes, -1);
+  if (S.movimientosPrev && S.movimientosPrev.mes === mesPrev) return;
+  cargarMesAnterior().then(() => {
+    if (S.tab === 'panorama' && S.movimientosPrev && S.movimientosPrev.mes === addMeses(S.mes, -1)) {
+      paint();
+    }
+  });
+}
+
 /* ============================================================
    Vistas — el DOM del módulo se reconstruye entero en cada paint()
    ============================================================ */
 function paint() {
   if (!S.container) return;
-  const tabs = [['mes', 'Mes'], ['resumen', 'Resumen'], ['objetivos', 'Objetivos']];
+  const tabs = [['panorama', 'Panorama'], ['mes', 'Mes'], ['resumen', 'Resumen'], ['objetivos', 'Objetivos']];
   let vista;
-  if (S.tab === 'resumen') vista = vistaResumen();
+  if (S.tab === 'panorama') vista = vistaPanorama();
+  else if (S.tab === 'resumen') vista = vistaResumen();
   else if (S.tab === 'objetivos') vista = vistaObjetivos();
   else vista = vistaMes();
   S.container.innerHTML = `
@@ -641,6 +830,64 @@ function paint() {
     ${S.objetivoModal ? modalObjetivo() : ''}
     ${S.targetModal ? modalTarget() : ''}
   </div>`;
+  animarVista();
+}
+
+// Count-up para montos: como anim.js countUp pero formatea cada frame con
+// separadores es-AR (miles) y prefijo de moneda. anim.js es solo-lectura, por eso
+// vive acá. Respeta prefers-reduced-motion (salta al valor final formateado).
+function countUpMoneda(el, to, { prefix = '', decimals = 0, dur = 1150 } = {}) {
+  if (!el) return;
+  const nf = new Intl.NumberFormat('es-AR', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  const fmt = (n) => prefix + nf.format(n);
+  const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduce) { el.textContent = fmt(to); return; }
+  let start = null;
+  const ease = (t) => 1 - Math.pow(1 - t, 3);
+  const step = (ts) => {
+    if (start === null) start = ts;
+    const p = Math.min(1, (ts - start) / dur);
+    el.textContent = fmt(to * ease(p));
+    if (p < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+// Dispara las animaciones del lenguaje "Instrumento Vivo" tras cada pintado:
+// count-up de números héroe, anillos SVG, barras que crecen, entrada escalonada,
+// tilt magnético. Todo respeta prefers-reduced-motion vía anim.js.
+function animarVista() {
+  const c = S.container;
+  if (!c) return;
+  // Montos héroe (con separadores de miles).
+  c.querySelectorAll('[data-count-money]').forEach(el => {
+    const to = +el.getAttribute('data-count-money') || 0;
+    const dec = +el.getAttribute('data-dec') || 0;
+    const prefix = el.getAttribute('data-prefix') || '';
+    countUpMoneda(el, to, { decimals: dec, prefix });
+  });
+  // Números que cuentan (tiles, porcentajes).
+  c.querySelectorAll('[data-count]').forEach(el => {
+    const to = +el.getAttribute('data-count') || 0;
+    const dec = +el.getAttribute('data-dec') || 0;
+    const prefix = el.getAttribute('data-prefix') || '';
+    const suffix = el.getAttribute('data-suffix') || '';
+    countUp(el, to, { decimals: dec, prefix, suffix });
+  });
+  // Anillos SVG.
+  c.querySelectorAll('.v-ring-fill').forEach(ci => ring(ci, +ci.getAttribute('data-pct') || 0));
+  // Barras (categorías, objetivos, waterfall): del 0 al ancho/alto objetivo.
+  c.querySelectorAll('[data-grow-w]').forEach(el => {
+    const w = el.getAttribute('data-grow-w');
+    requestAnimationFrame(() => requestAnimationFrame(() => { el.style.width = w; }));
+  });
+  c.querySelectorAll('[data-grow-h]').forEach(el => {
+    const h = el.getAttribute('data-grow-h');
+    requestAnimationFrame(() => requestAnimationFrame(() => { el.style.height = h; }));
+  });
+  // Entrada escalonada + tilt.
+  stagger(c.querySelectorAll('.rise'));
+  tiltAll(c);
 }
 
 function navMes() {
@@ -654,6 +901,217 @@ function navMes() {
     </div>
     <button class="pla-nav-btn" data-action="mes-next" aria-label="Mes siguiente">›</button>
   </div>`;
+}
+
+/* ---------- Tab PANORAMA (dashboard de entrada, default) ---------- */
+function vistaPanorama() {
+  const nav = navMes();
+  if (!configLista()) return nav + vacioConfig();
+  if (S.cargando) return nav + heroSkeleton();
+  const d = datosPanorama();
+  if (!d.hayDatos) {
+    return nav + `
+    <div class="pla-vacio rise">
+      <div class="pla-vacio-icono">📈</div>
+      <p>Sin movimientos en ${esc(labelMes(S.mes))}.</p>
+      <p class="pla-vacio-sub">Cargá tu primer ingreso o egreso en la pestaña <b>Mes</b> y acá vas a ver el balance, la evolución y el cashflow del mes vivos.</p>
+      <button class="pla-btn-primario" data-action="tab" data-tab="mes">Cargar movimiento</button>
+    </div>`;
+  }
+  return nav
+    + heroBalance(d)
+    + tilesPanorama(d)
+    + (d.topGastos.length ? topGastosCard(d) : '')
+    + waterfallCard(d);
+}
+
+// Número HÉROE del balance del mes, con curva/gradiente de fondo y delta vs. mes anterior.
+function heroBalance(d) {
+  const neg = d.balance < 0;
+  const signo = neg ? '−' : '';
+  const col = neg ? 'var(--danger)' : 'var(--accent)';
+  const abs = Math.abs(d.balance);
+  const decimales = d.principal === 'ARS' ? 0 : (abs % 1 !== 0 ? 2 : 0);
+  const prefijo = signo + simboloMoneda(d.principal) + ' ';
+  return `
+  <section class="pla-hero rise" style="--hcol:${col}">
+    <div class="pla-hero-curva">${curvaHero(d, neg)}</div>
+    <div class="pla-hero-cont">
+      <div class="pla-hero-cap">Balance de ${esc(labelMes(S.mes))} · ${esc(d.principal)}</div>
+      <div class="pla-hero-num pla-num" style="color:${col}"
+        data-count-money="${abs}" data-dec="${decimales}" data-prefix="${esc(prefijo)}">${esc(prefijo)}0</div>
+      <div class="pla-hero-fila">
+        ${deltaBadge(d.deltaBalance, d.sinComparacion, true)}
+        <div class="pla-hero-io">
+          <span class="pla-hero-io-item"><span class="pla-dot pla-dot-in"></span>Ingresos <b class="pla-num">${esc(fmtMonto(d.ingreso, d.principal))}</b></span>
+          <span class="pla-hero-io-item"><span class="pla-dot pla-dot-out"></span>Egresos <b class="pla-num">${esc(fmtMonto(d.egreso, d.principal))}</b></span>
+        </div>
+      </div>
+    </div>
+  </section>`;
+}
+
+// Curva decorativa de fondo del hero (SVG). No es un dato histórico (no lo hay aún):
+// es una firma visual que refleja el signo del balance (sube si positivo, baja si negativo).
+function curvaHero(d, neg) {
+  const path = neg
+    ? 'M0,26 C60,30 110,52 180,58 C250,64 300,54 360,60'
+    : 'M0,60 C60,54 110,30 180,26 C250,22 300,34 360,20';
+  const area = neg
+    ? 'M0,26 C60,30 110,52 180,58 C250,64 300,54 360,60 L360,80 L0,80 Z'
+    : 'M0,60 C60,54 110,30 180,26 C250,22 300,34 360,20 L360,80 L0,80 Z';
+  return `
+  <svg viewBox="0 0 360 80" preserveAspectRatio="none" aria-hidden="true">
+    <defs>
+      <linearGradient id="plaHeroGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="var(--hcol)" stop-opacity="0.28"></stop>
+        <stop offset="1" stop-color="var(--hcol)" stop-opacity="0"></stop>
+      </linearGradient>
+    </defs>
+    <path d="${area}" fill="url(#plaHeroGrad)"></path>
+    <path d="${path}" fill="none" stroke="var(--hcol)" stroke-width="2" stroke-linecap="round" opacity="0.85"></path>
+  </svg>`;
+}
+
+// Badge de delta ▲/▼ %. esBalance=true → subir es bueno (verde); false (gasto) →
+// bajar es bueno (gastar menos), se invierte el color.
+function deltaBadge(delta, sinComparacion, esBalance) {
+  if (sinComparacion || delta == null) {
+    return `<span class="pla-delta pla-delta-neutro">Sin mes anterior</span>`;
+  }
+  const sube = delta >= 0;
+  // Balance: subir es bueno (verde). Ver tile de gasto para el caso inverso.
+  const bueno = esBalance ? sube : !sube;
+  const flecha = sube ? '▲' : '▼';
+  const cls = Math.abs(delta) < 0.5 ? 'pla-delta-neutro' : (bueno ? 'pla-delta-ok' : 'pla-delta-mal');
+  const val = Math.abs(delta) >= 999 ? '999+' : fmtPct(Math.abs(delta));
+  return `<span class="pla-delta ${cls}">${flecha} ${val}% <span class="pla-delta-vs">vs. mes ant.</span></span>`;
+}
+
+function fmtPct(n) {
+  const v = Number(n) || 0;
+  return new Intl.NumberFormat('es-AR', { maximumFractionDigits: v < 10 ? 1 : 0 }).format(v);
+}
+
+// Fila de tiles vivos: balance por moneda + gasto del mes vs. anterior.
+function tilesPanorama(d) {
+  const tiles = [];
+  // Un tile por moneda con su balance (nunca mezcla monedas).
+  for (const t of d.tiles) {
+    const neg = t.balance < 0;
+    const col = neg ? 'var(--danger)' : 'var(--accent)';
+    const esPrincipal = t.moneda === d.principal;
+    tiles.push(`
+    <div class="pla-tile rise lively" data-tilt style="--tcol:${col}">
+      <div class="pla-tile-cap">Balance ${esc(t.moneda)}</div>
+      <div class="pla-tile-val pla-num" style="color:${col}">${neg ? '−' : ''}${esc(fmtMonto(t.balance, t.moneda))}</div>
+      <div class="pla-tile-sub">${esPrincipal ? deltaMini(d.deltaBalance, d.sinComparacion, true) : `<span class="pla-tile-io">+${esc(fmtMonto(t.ingreso, t.moneda))} · −${esc(fmtMonto(t.egreso, t.moneda))}</span>`}</div>
+    </div>`);
+  }
+  // Tile de gasto del mes (moneda principal) vs. anterior.
+  tiles.push(`
+  <div class="pla-tile rise lively" data-tilt style="--tcol:var(--accent-2)">
+    <div class="pla-tile-cap">Gasto del mes</div>
+    <div class="pla-tile-val pla-num" style="color:var(--text)">${esc(fmtMonto(d.egreso, d.principal))}</div>
+    <div class="pla-tile-sub">${deltaMini(d.deltaGasto, d.sinComparacion, false)}${d.egresoPrev != null ? ` <span class="pla-tile-io">ant. ${esc(fmtMonto(d.egresoPrev, d.principal))}</span>` : ''}</div>
+  </div>`);
+  return `<section class="pla-tiles">${tiles.join('')}</section>`;
+}
+
+function deltaMini(delta, sinComparacion, esBalance) {
+  if (sinComparacion || delta == null) return `<span class="pla-delta-mini pla-delta-neutro">—</span>`;
+  const sube = delta >= 0;
+  const bueno = esBalance ? sube : !sube;
+  const flecha = sube ? '▲' : '▼';
+  const cls = Math.abs(delta) < 0.5 ? 'pla-delta-neutro' : (bueno ? 'pla-delta-ok' : 'pla-delta-mal');
+  const val = Math.abs(delta) >= 999 ? '999+' : fmtPct(Math.abs(delta));
+  return `<span class="pla-delta-mini ${cls}">${flecha} ${val}%</span>`;
+}
+
+// Card "Top 3 gastos del mes" (moneda principal).
+function topGastosCard(d) {
+  const max = d.topGastos.reduce((m, g) => Math.max(m, g.monto), 0);
+  return `
+  <section class="pla-card pla-top rise lively" data-tilt>
+    <div class="pla-card-titulo">Top gastos · ${esc(d.principal)}</div>
+    <div class="pla-top-lista">
+      ${d.topGastos.map((g, i) => {
+        const pct = max > 0 ? Math.max(6, (g.monto / max) * 100) : 0;
+        return `
+        <div class="pla-top-item">
+          <div class="pla-top-rank">${i + 1}</div>
+          <div class="pla-top-info">
+            <div class="pla-top-fila">
+              <span class="pla-top-nombre">${esc(g.titulo)}</span>
+              <span class="pla-top-monto pla-num">${esc(fmtMonto(g.monto, g.moneda))}</span>
+            </div>
+            ${g.sub ? `<div class="pla-top-sub">${esc(g.sub)}</div>` : ''}
+            <div class="pla-top-bar"><div class="pla-top-fill" style="width:0" data-grow-w="${pct}%"></div></div>
+          </div>
+        </div>`;
+      }).join('')}
+    </div>
+  </section>`;
+}
+
+// Card del cashflow del mes tipo WATERFALL (SVG inline). Barras flotantes que
+// animan su altura al montar: saldo 0 → +ingresos → −egresos por categoría → balance.
+function waterfallCard(d) {
+  const w = d.waterfall;
+  if (!w || !w.pasos.length) return '';
+  const H = 220;            // alto útil del área de barras (px)
+  const rango = (w.max - w.min) || 1;
+  const y0 = (H * (w.max)) / rango;          // píxel del cero (medido desde arriba)
+  const yDe = (v) => (H * (w.max - v)) / rango;
+  const barras = w.pasos.map((p, i) => {
+    const top = Math.min(yDe(p.desde), yDe(p.hasta));
+    const bottom = Math.max(yDe(p.desde), yDe(p.hasta));
+    const alto = Math.max(2, bottom - top);
+    const col = p.tipo === 'ingreso' ? 'var(--ok)'
+      : p.tipo === 'egreso' ? 'var(--danger)'
+      : (p.tipo === 'balance' ? (p.delta < 0 ? 'var(--danger)' : 'var(--accent)') : 'var(--text-faint)');
+    const sub = p.tipo === 'base' ? '' : `${p.delta > 0 ? '+' : (p.delta < 0 ? '−' : '')}${esc(fmtMonto(Math.abs(p.delta), w.moneda))}`;
+    // La barra "base" (inicio en 0) no dibuja columna, solo la etiqueta de arranque.
+    const columna = p.tipo === 'base'
+      ? `<div class="pla-wf-base" style="top:${y0.toFixed(1)}px"></div>`
+      : `<div class="pla-wf-col" style="top:${top.toFixed(1)}px; height:0; background:${col}" data-grow-h="${alto.toFixed(1)}px"></div>`;
+    return `
+    <div class="pla-wf-slot" style="--wcol:${col}">
+      <div class="pla-wf-area">
+        ${columna}
+      </div>
+      <div class="pla-wf-val pla-num">${sub}</div>
+      <div class="pla-wf-lbl">${esc(p.label)}</div>
+    </div>`;
+  }).join('');
+  return `
+  <section class="pla-card pla-wf rise">
+    <div class="pla-card-titulo">Cashflow del mes · ${esc(w.moneda)}</div>
+    <div class="pla-wf-graf" style="--wf-h:${H}px">
+      <div class="pla-wf-cero" style="top:${y0.toFixed(1)}px"></div>
+      <div class="pla-wf-slots">${barras}</div>
+    </div>
+    <div class="pla-wf-leyenda">
+      <span><span class="pla-dot pla-dot-in"></span>Ingresos</span>
+      <span><span class="pla-dot pla-dot-out"></span>Egresos por categoría</span>
+      <span><span class="pla-dot pla-dot-bal"></span>Balance</span>
+    </div>
+  </section>`;
+}
+
+// Skeleton vivo del hero mientras carga el mes.
+function heroSkeleton() {
+  return `
+  <section class="pla-hero">
+    <div class="pla-hero-cont">
+      <div class="shimmer" style="height:14px;width:45%;margin-bottom:14px"></div>
+      <div class="shimmer" style="height:40px;width:70%;margin-bottom:14px"></div>
+      <div class="shimmer" style="height:16px;width:55%"></div>
+    </div>
+  </section>
+  <section class="pla-tiles">
+    ${[0, 1, 2].map(() => `<div class="pla-tile"><div class="shimmer" style="height:64px"></div></div>`).join('')}
+  </section>`;
 }
 
 function vacioConfig() {
@@ -681,7 +1139,7 @@ function formCaptura() {
   const cats = cfgCategorias(f.tipo);
   const esIngreso = f.tipo === 'ingreso';
   return `
-  <form class="pla-form pla-card" data-action="guardar-mov" autocomplete="off">
+  <form class="pla-form pla-card rise" data-action="guardar-mov" autocomplete="off">
     <div class="pla-tipo-toggle" role="group" aria-label="Tipo de movimiento">
       <button type="button" class="pla-tipo-btn${esIngreso ? ' activa pla-tipo-ingreso' : ''}" data-action="set-tipo" data-tipo="ingreso">Ingreso</button>
       <button type="button" class="pla-tipo-btn${!esIngreso ? ' activa pla-tipo-egreso' : ''}" data-action="set-tipo" data-tipo="egreso">Egreso</button>
@@ -730,7 +1188,7 @@ function formCaptura() {
 function listaMovimientos() {
   if (!S.movimientos.length) {
     return `
-    <div class="pla-vacio">
+    <div class="pla-vacio rise">
       <div class="pla-vacio-icono">💸</div>
       <p>Sin movimientos en ${esc(labelMes(S.mes))}.</p>
       <p class="pla-vacio-sub">Cargá tu primer ingreso o egreso con el formulario de arriba. Monto → guardar, listo.</p>
@@ -738,7 +1196,7 @@ function listaMovimientos() {
   }
   const grupos = movimientosPorDia();
   return `<div class="pla-lista">${grupos.map(([fecha, movs]) => `
-    <div class="pla-dia">
+    <div class="pla-dia rise">
       <div class="pla-dia-head">${esc(labelDiaLista(fecha))}</div>
       ${movs.map(filaMovimiento).join('')}
     </div>`).join('')}</div>`;
@@ -769,7 +1227,7 @@ function vistaResumen() {
   const resumen = resumenMes();
   if (!resumen.length) {
     return nav + `
-    <div class="pla-vacio">
+    <div class="pla-vacio rise">
       <div class="pla-vacio-icono">📊</div>
       <p>Nada para resumir en ${esc(labelMes(S.mes))}.</p>
       <p class="pla-vacio-sub">Cargá movimientos en la pestaña Mes y acá aparece el resumen por moneda, ámbito y categoría.</p>
@@ -781,7 +1239,7 @@ function vistaResumen() {
 function bloqueResumenMoneda(r) {
   const balCls = r.balance >= 0 ? 'pla-mov-ingreso' : 'pla-mov-egreso';
   return `
-  <section class="pla-card pla-res">
+  <section class="pla-card pla-res rise lively" data-tilt>
     <div class="pla-res-head">
       <h3 class="pla-res-moneda">${esc(r.moneda)}</h3>
     </div>
@@ -794,7 +1252,7 @@ function bloqueResumenMoneda(r) {
         <span class="pla-res-tot-k">Egresos</span>
         <span class="pla-res-tot-v pla-mov-egreso pla-num">${esc(fmtMonto(r.egreso, r.moneda))}</span>
       </div>
-      <div class="pla-res-tot">
+      <div class="pla-res-tot pla-res-tot-bal">
         <span class="pla-res-tot-k">Balance</span>
         <span class="pla-res-tot-v ${balCls} pla-num">${r.balance < 0 ? '−' : ''}${esc(fmtMonto(r.balance, r.moneda))}</span>
       </div>
@@ -824,7 +1282,7 @@ function bloqueResumenMoneda(r) {
             <span class="pla-res-cat-nombre">${esc(c.categoria)}</span>
             <span class="pla-res-cat-monto pla-num">${esc(fmtMonto(c.egreso, r.moneda))}</span>
           </div>
-          <div class="pla-res-cat-bar"><div class="pla-res-cat-fill" style="width:${pct}%"></div></div>
+          <div class="pla-res-cat-bar"><div class="pla-res-cat-fill" style="width:0" data-grow-w="${pct}%"></div></div>
         </div>`;
       }).join('')}
     </div>` : ''}
@@ -841,10 +1299,10 @@ function vistaObjetivos() {
   const nuevo = `<button class="pla-btn-primario pla-obj-nuevo" data-action="nuevo-objetivo">+ Nuevo objetivo</button>`;
   if (!S.objetivos.length) {
     return `
-    <div class="pla-vacio">
+    <div class="pla-vacio rise">
       <div class="pla-vacio-icono">🎯</div>
       <p>Todavía no tenés objetivos.</p>
-      <p class="pla-vacio-sub">Un objetivo es una meta de plata (ej: la compra de una propiedad). Creá uno y andá aportando.</p>
+      <p class="pla-vacio-sub">Un objetivo es una meta de plata a la que le vas aportando (una compra, un colchón, un viaje). Definís un target opcional y seguís el progreso.</p>
       ${nuevo}
     </div>`;
   }
@@ -858,7 +1316,7 @@ function cardObjetivo(obj) {
   const pct = tieneTarget ? Math.min(100, (total / target) * 100) : 0;
   const completo = tieneTarget && total >= target;
   return `
-  <section class="pla-card pla-obj${completo ? ' pla-obj-completo' : ''}">
+  <section class="pla-card pla-obj${completo ? ' pla-obj-completo' : ''} rise lively" data-tilt>
     <div class="pla-obj-head">
       <div class="pla-obj-info">
         <h3 class="pla-obj-nombre">${esc(obj.nombre)}</h3>
@@ -873,7 +1331,7 @@ function cardObjetivo(obj) {
         <span class="pla-num pla-obj-total">${esc(fmtMonto(total, obj.moneda))}</span>
         <span class="pla-obj-de">/ ${esc(fmtMonto(target, obj.moneda))}</span>
       </div>
-      <div class="pla-obj-bar"><div class="pla-obj-fill${completo ? ' pla-obj-fill-ok' : ''}" style="width:${pct}%"></div></div>
+      <div class="pla-obj-bar"><div class="pla-obj-fill${completo ? ' pla-obj-fill-ok' : ''}" style="width:0" data-grow-w="${pct}%"></div></div>
       <div class="pla-obj-pct">${completo ? '¡Objetivo cumplido! 🎉' : Math.floor(pct) + '% · faltan ' + esc(fmtMonto(target - total, obj.moneda))}</div>
     </div>` : `
     <div class="pla-obj-prog">
@@ -946,7 +1404,7 @@ function modalObjetivo() {
       <form class="pla-modal-form" data-action="objetivo" autocomplete="off">
         <label class="pla-field">
           <span class="pla-campo-label">Nombre</span>
-          <input class="pla-input" name="nombre" type="text" placeholder="Compra de propiedad" required maxlength="120" value="${esc(obj ? obj.nombre : '')}" autofocus>
+          <input class="pla-input" name="nombre" type="text" placeholder="Ej: colchón de emergencia" required maxlength="120" value="${esc(obj ? obj.nombre : '')}" autofocus>
         </label>
         <div class="pla-form-grid">
           <label class="pla-field">
@@ -1008,8 +1466,9 @@ const CSS = `
 .pla-head-fila { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
 .pla-titulo { margin: 0; font-family: var(--font-display); font-size: 1.35rem; letter-spacing: .01em; }
 .pla-tabs { display: flex; gap: var(--space-2); overflow-x: auto; -webkit-overflow-scrolling: touch; }
-.pla-tab { flex: 1 1 0; min-height: 44px; padding: var(--space-2) var(--space-3); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-dim); white-space: nowrap; transition: background .15s, color .15s, border-color .15s; }
-.pla-tab.activa { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.pla-tab { flex: 1 1 0; min-height: 44px; padding: var(--space-2) var(--space-3); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-dim); white-space: nowrap; font-weight: 600; transition: background var(--dur) ease, color var(--dur) ease, border-color var(--dur) ease, transform var(--dur) var(--ease-out-expo); }
+.pla-tab:hover { color: var(--text); border-color: var(--border-strong); }
+.pla-tab.activa { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 700; }
 
 /* Navegación de mes */
 .pla-mesnav { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-4); }
@@ -1020,7 +1479,8 @@ const CSS = `
 .pla-chip { background: var(--accent-soft); color: var(--accent); border: none; border-radius: 999px; padding: var(--space-1) var(--space-3); font-size: .78rem; min-height: 28px; }
 
 /* Cards */
-.pla-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--space-4); margin-bottom: var(--space-4); box-shadow: var(--shadow-1); }
+.pla-card { position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--space-4); margin-bottom: var(--space-4); box-shadow: var(--shadow-1); overflow: hidden; }
+.pla-card-titulo { font-size: .72rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; color: var(--text-faint); margin-bottom: var(--space-3); }
 
 /* Form de captura */
 .pla-form { display: flex; flex-direction: column; gap: var(--space-3); }
@@ -1086,7 +1546,7 @@ select.pla-input { appearance: none; -webkit-appearance: none; background-image:
 .pla-res-cat-nombre { font-size: .85rem; overflow-wrap: anywhere; }
 .pla-res-cat-monto { font-size: .82rem; color: var(--text-dim); white-space: nowrap; }
 .pla-res-cat-bar { height: 8px; background: var(--surface-2); border-radius: 999px; overflow: hidden; }
-.pla-res-cat-fill { height: 100%; border-radius: 999px; background: var(--accent-2); transition: width .35s ease; }
+.pla-res-cat-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent-2), color-mix(in srgb, var(--accent-2) 60%, var(--accent))); transition: width var(--dur-slow) var(--ease-out-expo); }
 .pla-res-aportes { margin-top: var(--space-4); padding-top: var(--space-3); border-top: 1px solid var(--border); font-size: .82rem; color: var(--text-dim); }
 
 /* Objetivos */
@@ -1103,16 +1563,21 @@ select.pla-input { appearance: none; -webkit-appearance: none; background-image:
 .pla-obj-total { font-size: 1.5rem; font-weight: 700; }
 .pla-obj-de { font-size: .82rem; color: var(--text-dim); }
 .pla-obj-bar { height: 12px; background: var(--surface-2); border-radius: 999px; overflow: hidden; }
-.pla-obj-fill { height: 100%; border-radius: 999px; background: var(--accent); transition: width .35s ease; }
+.pla-obj-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent-2), var(--accent)); transition: width var(--dur-slow) var(--ease-out-expo); }
 .pla-obj-fill-ok { background: linear-gradient(90deg, var(--accent), var(--ok)); }
 .pla-obj-pct { font-size: .78rem; color: var(--text-dim); margin-top: var(--space-2); }
 .pla-obj-completo .pla-obj-pct { color: var(--ok); }
 .pla-obj-acciones { display: flex; gap: var(--space-2); flex-wrap: wrap; }
 .pla-obj-aportar { flex: 1; min-width: 120px; }
 
-/* Modales */
-.pla-modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-end; justify-content: center; background: color-mix(in srgb, var(--bg) 75%, transparent); backdrop-filter: blur(2px); }
-.pla-modal-card { width: 100%; max-width: 480px; max-height: 88vh; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-lg) var(--radius-lg) 0 0; padding: var(--space-4); box-shadow: var(--shadow-2); }
+/* Modales — glass: fondo difuminado + card que entra */
+.pla-modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-end; justify-content: center; background: color-mix(in srgb, var(--bg) 68%, transparent); backdrop-filter: blur(8px) saturate(1.2); -webkit-backdrop-filter: blur(8px) saturate(1.2); animation: pla-fade var(--dur) ease; }
+.pla-modal-card { position: relative; width: 100%; max-width: 480px; max-height: 88vh; display: flex; flex-direction: column; background: color-mix(in srgb, var(--surface) 88%, transparent); border: 1px solid var(--border-strong); border-radius: var(--radius-lg) var(--radius-lg) 0 0; padding: var(--space-5) var(--space-4); box-shadow: var(--shadow-2); animation: pla-modal-in var(--dur-slow) var(--ease-out-expo); }
+.pla-modal-card::before { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; background: var(--glow-accent); opacity: .5; }
+.pla-modal-card > * { position: relative; }
+@keyframes pla-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes pla-modal-in { from { opacity: 0; transform: translateY(24px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .pla-modal, .pla-modal-card { animation: none !important; } }
 .pla-modal-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); margin-bottom: var(--space-4); }
 .pla-modal-titulo { margin: 0; font-family: var(--font-display); font-size: 1.05rem; overflow-wrap: anywhere; }
 .pla-modal-form { display: flex; flex-direction: column; gap: var(--space-3); overflow-y: auto; }
@@ -1125,12 +1590,88 @@ select.pla-input { appearance: none; -webkit-appearance: none; background-image:
 .pla-vacio .pla-btn-primario { margin-top: var(--space-4); }
 .pla-cargando { padding: var(--space-8) var(--space-4); text-align: center; color: var(--text-faint); font-size: .9rem; }
 
+/* ============================================================
+   PANORAMA — hero + tiles + top gastos + waterfall
+   ============================================================ */
+
+/* Hero: número héroe del balance con curva de fondo */
+.pla-hero { position: relative; overflow: hidden; border-radius: var(--radius-lg); border: 1px solid var(--border-strong); background:
+  linear-gradient(160deg, color-mix(in srgb, var(--hcol) 8%, transparent), transparent 55%), var(--surface);
+  padding: clamp(18px, 4vw, 28px); margin-bottom: var(--space-4); }
+.pla-hero::before { content: ""; position: absolute; width: 320px; height: 320px; right: -80px; top: -160px; border-radius: 50%; pointer-events: none;
+  background: radial-gradient(circle, color-mix(in srgb, var(--hcol) 14%, transparent), transparent 65%); animation: vida-breathe 5.5s ease-in-out infinite; }
+.pla-hero-curva { position: absolute; left: 0; right: 0; bottom: 0; height: 80px; pointer-events: none; opacity: .9; }
+.pla-hero-curva svg { width: 100%; height: 100%; display: block; }
+.pla-hero-cont { position: relative; }
+.pla-hero-cap { font-size: .72rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); }
+.pla-hero-num { display: block; margin: var(--space-2) 0 var(--space-3); font-weight: 800; font-size: clamp(2.1rem, 7vw, 3.2rem); line-height: 1; letter-spacing: -.02em; overflow-wrap: anywhere; }
+.pla-hero-fila { display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap; }
+.pla-hero-io { display: flex; gap: var(--space-4); flex-wrap: wrap; font-size: .82rem; color: var(--text-dim); }
+.pla-hero-io-item { display: inline-flex; align-items: center; gap: 6px; }
+.pla-hero-io-item b { color: var(--text); font-weight: 700; }
+
+/* Puntos de leyenda */
+.pla-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block; }
+.pla-dot-in { background: var(--ok); }
+.pla-dot-out { background: var(--danger); }
+.pla-dot-bal { background: var(--accent); }
+
+/* Delta badges */
+.pla-delta { display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px; border-radius: 999px; font-size: .74rem; font-weight: 700; font-family: var(--font-num); white-space: nowrap; }
+.pla-delta-vs { font-family: var(--font-ui); font-weight: 600; font-size: .68rem; opacity: .7; }
+.pla-delta-ok { background: rgba(67,209,124,.14); color: var(--ok); }
+.pla-delta-mal { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
+.pla-delta-neutro { background: var(--surface-2); color: var(--text-dim); }
+.pla-delta-mini { display: inline-flex; align-items: center; gap: 3px; font-family: var(--font-num); font-size: .74rem; font-weight: 700; padding: 2px 7px; border-radius: 999px; }
+.pla-delta-mini.pla-delta-ok { background: rgba(67,209,124,.14); color: var(--ok); }
+.pla-delta-mini.pla-delta-mal { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
+.pla-delta-mini.pla-delta-neutro { background: var(--surface-2); color: var(--text-faint); }
+
+/* Tiles vivos */
+.pla-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--space-3); margin-bottom: var(--space-4); }
+.pla-tile { position: relative; padding: var(--space-4); border-radius: var(--radius-lg); background: var(--surface); border: 1px solid var(--border); overflow: hidden; }
+.pla-tile::after { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--tcol); opacity: .7; }
+.pla-tile:hover { border-color: color-mix(in srgb, var(--tcol) 45%, transparent); }
+.pla-tile-cap { font-size: .68rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--text-faint); }
+.pla-tile-val { margin-top: var(--space-2); font-size: 1.3rem; font-weight: 800; line-height: 1.1; overflow-wrap: anywhere; }
+.pla-tile-sub { margin-top: var(--space-2); display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; font-size: .74rem; color: var(--text-dim); }
+.pla-tile-io { color: var(--text-faint); }
+
+/* Top gastos */
+.pla-top-lista { display: flex; flex-direction: column; gap: var(--space-3); }
+.pla-top-item { display: flex; align-items: flex-start; gap: var(--space-3); }
+.pla-top-rank { flex: none; width: 24px; height: 24px; border-radius: 8px; display: grid; place-items: center; background: var(--accent-2-soft); color: var(--accent-2); font-family: var(--font-num); font-weight: 700; font-size: .8rem; margin-top: 2px; }
+.pla-top-info { flex: 1; min-width: 0; }
+.pla-top-fila { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); }
+.pla-top-nombre { font-size: .9rem; font-weight: 600; overflow-wrap: anywhere; }
+.pla-top-monto { font-size: .88rem; font-weight: 700; color: var(--danger); white-space: nowrap; }
+.pla-top-sub { font-size: .74rem; color: var(--text-dim); margin-top: 1px; overflow-wrap: anywhere; }
+.pla-top-bar { height: 6px; background: var(--surface-2); border-radius: 999px; overflow: hidden; margin-top: 6px; }
+.pla-top-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--danger), color-mix(in srgb, var(--danger) 55%, transparent)); transition: width var(--dur-slow) var(--ease-out-expo); }
+
+/* Waterfall */
+.pla-wf-graf { position: relative; height: var(--wf-h); margin: var(--space-2) 0 var(--space-3); }
+.pla-wf-cero { position: absolute; left: 0; right: 0; height: 1px; background: var(--border-strong); z-index: 1; }
+.pla-wf-slots { position: relative; display: flex; align-items: stretch; gap: 2px; height: 100%; z-index: 2; overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 2px; }
+.pla-wf-slot { flex: 1 1 0; min-width: 46px; display: flex; flex-direction: column; }
+.pla-wf-area { position: relative; height: var(--wf-h); }
+.pla-wf-col { position: absolute; left: 12%; right: 12%; border-radius: 4px; transition: height var(--dur-slow) var(--ease-out-expo); box-shadow: 0 0 10px color-mix(in srgb, var(--wcol) 45%, transparent); }
+.pla-wf-base { position: absolute; left: 20%; right: 20%; height: 2px; border-radius: 2px; background: var(--text-faint); transform: translateY(-1px); }
+.pla-wf-val { margin-top: var(--space-1); font-size: .62rem; color: var(--text-dim); text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pla-wf-lbl { font-size: .6rem; color: var(--text-faint); text-align: center; text-transform: capitalize; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pla-wf-leyenda { display: flex; gap: var(--space-4); flex-wrap: wrap; padding-top: var(--space-3); border-top: 1px solid var(--border); font-size: .72rem; color: var(--text-dim); }
+.pla-wf-leyenda span { display: inline-flex; align-items: center; gap: 6px; }
+
+/* Balance destacado en el resumen */
+.pla-res-tot-bal { background: color-mix(in srgb, var(--accent) 8%, var(--surface-2)); border: 1px solid var(--border); }
+
 /* Desktop */
 @media (min-width: 768px) {
-  .pla { padding: var(--space-6); }
+  .pla { padding: var(--space-6); max-width: 860px; }
   .pla-tab { flex: none; }
   .pla-modal { align-items: center; }
   .pla-modal-card { border-radius: var(--radius-lg); }
+  .pla-wf-slot { min-width: 0; }
 }
 `;
 
@@ -1153,10 +1694,11 @@ export default {
     S.container = container;
     S.userId = userId;
     S.config = config;
-    S.tab = 'mes';
+    S.tab = 'panorama';
     S.mes = mesActual();
     S.form = formInicial();
     S.movimientos = [];
+    S.movimientosPrev = null;
     S.objetivos = [];
     S.aportesObjetivos = [];
     S.aporteModal = null;
@@ -1183,6 +1725,8 @@ export default {
       toast('No se pudieron cargar los movimientos: ' + msgErr(err), 'error');
     }
     this.render();
+    // El Panorama es el tab default → traer el mes anterior para el delta (tolerante).
+    if (S.tab === 'panorama') asegurarMesAnterior();
   },
 
   render() {
@@ -1190,25 +1734,32 @@ export default {
     if (!supabase) return;
     // Si cambió el mes real desde la última visita (app abierta cruzando de mes),
     // reenganchar el mes visible al actual sin dejar datos viejos bajo el label.
-    if (S.tab === 'mes' && S.mes !== mesActual() && Date.now() - S.ultimaCarga > 6 * 60 * 60 * 1000) {
+    if ((S.tab === 'mes' || S.tab === 'panorama' || S.tab === 'resumen')
+        && S.mes !== mesActual() && Date.now() - S.ultimaCarga > 6 * 60 * 60 * 1000) {
       S.mes = mesActual();
       S.movimientos = [];
+      S.movimientosPrev = null; // el cache del mes anterior ya no corresponde
       S.cargando = true;
       paint();
       S.ultimaCarga = Date.now();
       cargarMovimientos()
-        .then(() => { S.cargando = false; paint(); })
+        .then(() => { S.cargando = false; paint(); if (S.tab === 'panorama') asegurarMesAnterior(); })
         .catch(() => { S.cargando = false; paint(); toast('No se pudo actualizar el mes', 'warning'); });
       return;
     }
     paint();
+    if (S.tab === 'panorama') asegurarMesAnterior();
     // Refresco silencioso al volver de otra ruta (multi-device).
     if (Date.now() - S.ultimaCarga > 30000) {
       S.ultimaCarga = Date.now();
       const tareas = [cargarMovimientos()];
       if (S.objetivos.length || S.tab === 'objetivos') tareas.push(cargarObjetivos());
       Promise.all(tareas)
-        .then(() => paint())
+        .then(() => {
+          // El mes anterior también pudo cambiar en otro device → refrescar su cache.
+          if (S.tab === 'panorama') { S.movimientosPrev = null; asegurarMesAnterior(); }
+          paint();
+        })
         .catch(() => { /* silencioso: la data pintada coincide con su label */ });
     }
   },
