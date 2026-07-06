@@ -53,6 +53,9 @@ Tamaño: **S** rápido · **M** mediano · **L** grande. `[IA]` = requiere API k
 | Foto al plato → macros | L `[IA]` | Reusa seam de captura |
 | Sueño como fundación del día | L | **Gran conector**: energía, adherencia, volumen |
 | Dashboard de Cuerpo unificado ("instrumento vivo") | L | Cara de Cuerpo en el Home |
+| Botones de escala rápida de porción (½·¾·1x·1.5x·2x) | S | Cal AI — escalar sin tipear (§7) |
+| Anillo héroe de proteína + swipe a macros secundarios | S | Cal AI — pero proteína, no calorías (§7) |
+| Foto→macros con loop de corrección de 1 tap | L `[IA]` | Cal AI — el estándar del rubro (§7) |
 
 **Top 3:** captura por voz · anillos+ayuno+sparkline (la piel premium) · estado/energía + sueño (materia prima de Insights).
 
@@ -219,3 +222,60 @@ El arranque en 6 pasos. Cada paso entrega algo verificable y no rompe lo anterio
 **Orden recomendado:** 1 y 2 en paralelo (la base) → 3 (que los usa) → 4 y 5. Si querés el "wow" cuanto antes, el paso 3 (Home cockpit) es el primer entregable visible; la captura (4) puede ir justo después.
 
 **Único SQL de la Ola 1:** la clave `user_config.insights.umbrales` (opcional, con fallbacks). Todo lo demás es front + lógica sobre tablas que ya existen. Las señales nuevas (peso, energía, sueño) y sus tablas son de la Ola 2.
+
+---
+
+## 7. Benchmark: Cal AI & food trackers con IA → Nutrición
+
+Investigamos **Cal AI** (líder del "foto→macros", ~$50M ARR, comprada por MyFitnessPal en 3/2026) y sus competidores (SnapCalorie, Foodvisor, Bitesnap, MacroFactor, Carbon Diet Coach). Qué robar, qué evitar, y dónde VIDA les gana.
+
+### A robar — sin IA (determinístico, se puede en Ola 2)
+
+| Feature de Cal AI | Adaptación a VIDA |
+|---|---|
+| **Anillo héroe + macro-rings + swipe a secundarias** (un número grande = "lo que queda", detalle a un swipe) | Igual, pero el héroe es **proteína** (target ~160g), no calorías. Fiel a §5. Reusa el anillo de `anim.js` |
+| **Botones de escala rápida** de porción (½·¾·1x·1.25x·1.5x·2x) | Sobre cualquier ancla/combo: escalás la porción de 1 tap, sin tipear macros |
+| **Relog / "food memory" de 1 tap** (recuerda tus comidas frecuentes) | Ya es nuestro concepto de **anclas + combos favoritos**. Cal AI lo validó a escala de $30M+ |
+| **Onboarding: Mifflin-St Jeor + factor de actividad + selector de objetivo con timeline en vivo** ("a este ritmo llegás a X kg el DD/MM") | El cálculo ya está en §5; el microinteractivo del timeline lo hace tangible. Va en Fase 6 (onboarding), el cálculo sirve ya |
+| **Streaks + "trophy room" de logros** | Cruza con la racha de adherencia nutricional (ya en catálogo §2) |
+| **Peso con gráficos 7/30/90/anual** | Ya en catálogo (peso + tendencia suavizada) |
+
+### A robar — con IA (Ola 3, visión + serverless)
+
+- **Foto→macros con loop de corrección de 1 tap**: foto → ítems detectados por separado + porción estimada → el usuario ajusta con slider/escala, swap de ítem, agrega lo que la cámara no vio, o edita el macro. **Nunca auto-commit** (ya es el patrón de captura §15). Cal AI usa *depth sensor* para el volumen; VIDA puede arrancar solo con Claude visión (mayor error) y pedir confirmación de porción.
+- **Digitalizar etiqueta nutricional** (foto de la tabla → campos).
+- **Describe tu comida por voz/texto** → ya es la captura universal (la joya de §4).
+- **Resúmenes diarios/semanales por IA** → ya en el cerebro (coach proactivo §2).
+
+### Lo que NO hacemos — los errores de Cal AI son nuestro diferencial
+
+- **Precisión honesta.** El foto→macros de TODA la categoría tiene **10–25% de error** (peor en platos mixtos; subestima ~20%; no ve aceites/salsas). Cal AI publicita "90%" sin citar. VIDA muestra **rango/confianza** y prioriza estimar bien **la proteína (la ancla)**, con corrección de 1 tap. Honestidad > marketing.
+- **Seguridad por diseño.** Cal AI tuvo un **breach de 3,2M usuarios** (Firebase abierto, PINs de 4 dígitos sin rate-limit). VIDA ya tiene **RLS por `user_id` en toda tabla** (CLAUDE.md §1) — el cimiento que a ellos les faltó.
+- **Sin paywall engañoso.** Cal AI fue **bajado del App Store (4/2026)** por billing engañoso. VIDA es personal-first; si algún día hay billing (Fase 6), transparente.
+
+### También robá de los que NO son Cal AI
+
+- **MacroFactor — TDEE adaptativo** (el mejor concepto del rubro): en vez de una fórmula estática, calcula tu gasto *real* revirtiendo tu tendencia de peso vs. ingesta y **recalibra solo cada semana**. Para VIDA: alimentado por tu **volumen de Training real** + peso de referencia (no solo pasos). Día de pierna pesado → sube el target de carbos.
+- **MacroFactor — "adherence-neutral"**: no castiga el tracking imperfecto. Clave para retención sana (coherente con tu Rutina "gamificación sana").
+- **MacroFactor — "grounded, not generated"**: los macros salen de ingredientes de una **base verificada** (tus anclas `nutricion_alimentos` del §5), no de un número alucinado por el LLM. Tu seed ES la fuente de verdad.
+- **Cronometer — micronutrientes con DB verificada**: cruza con tu "modo nutricionista" (Dra. Briner define objetivos de micros).
+
+### Precisión: el whitespace del rubro (donde VIDA es honesta y gana confianza)
+
+El error real del foto→macros es 10–25% (la grasa invisible tiene ~55% de error — "es física, no IA"). Casi ninguna app muestra esa incertidumbre: tiran un número falsamente preciso ("487 kcal") que puede estar 20-30% mal. Ese es el hueco. Principios para VIDA:
+
+1. **Voz > foto para tu caso.** El hallazgo más fuerte: la foto sola correlaciona **0.59** con la realidad; **foto + una frase de contexto ("2 cucharadas de aceite") salta a 0.94**. Tu captura por voz *ya* le dice a la app lo que la cámara no ve. Ventaja estructural.
+2. **Mostrá banda, no falsa precisión.** "~480 kcal (±20%)" o un rango. **El ancho de la banda = calidad del input**: solo foto = ancha; foto + porción confirmada + aceite declarado = angosta. De las poquísimas apps honestas.
+3. **"Agregá lo invisible" de 1 tap** tras cada captura: método de cocción, aceite, salsa, multiplicador de porción. Es la palanca de precisión #1 (0.59→0.94).
+4. **Optimizá consistencia, no perfección por comida.** Loguear los mismos combos igual cada día lava el error (~±0.65% en un mes por cancelación estadística). Tus anclas/combos de 1 tap explotan esto — ventaja técnica sobre la foto.
+5. **Framing sano (ético).** Los calorie trackers se asocian a conductas alimentarias problemáticas cuando usan límites duros + rojo/verde. VIDA: **rangos en vez de límites, tendencia en vez del número del día, cero shaming.**
+
+### El foso: lo que ninguna food app tiene
+
+Cal AI, MacroFactor, Cronometer & co. son **islas de comida**. VIDA cruza la comida con **plata, gym y hábitos** (las palancas §3), y estas interconexiones son imposibles para una app aislada:
+- **Nutrición ↔ Training:** TDEE adaptativo por volumen de entrenamiento real (no solo pasos).
+- **Nutrición ↔ Rutina:** la **creatina y el whey** son ítems de hábito → un check, dos módulos actualizados.
+- **Nutrición ↔ Plata (nadie lo hace):** la **lista de compras del plan semanal → gasto proyectado** categorizado, contra tu objetivo de ahorro. *"Tu meal prep de esta semana = $X, Y% sobre presupuesto de comida."*
+- **Insights cruzados (§3):** *"las semanas que clavaste proteína, tu press subió"* — justo la **guía** que los usuarios de Cal AI piden a gritos y que ninguna food app da.
+
+**Ese es el diferencial defendible.**
