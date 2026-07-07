@@ -9,10 +9,12 @@ import { initCaptura } from './core/captura.js';
 const MODULES = [
   { id: 'home',      label: 'Inicio',    icon: '🏠', enabled: true,  loader: () => import('./modules/home.js') },
   { id: 'nutricion', label: 'Nutrición', icon: '🥩', enabled: true,  loader: () => import('./modules/nutricion.js') },
+  { id: 'cuerpo',    label: 'Cuerpo',    icon: '🫀', enabled: true,  loader: () => import('./modules/cuerpo.js') },
   { id: 'plata',     label: 'Plata',     icon: '💵', enabled: true,  loader: () => import('./modules/plata.js') },
   { id: 'rutina',    label: 'Rutina',    icon: '☀️', enabled: true,  loader: () => import('./modules/rutina.js') },
   { id: 'training',  label: 'Training',  icon: '🏋️', enabled: true,  loader: () => import('./modules/training.js') },
   { id: 'insights',  label: 'Insights',  icon: '🧠', enabled: true,  loader: () => import('./modules/insights.js') },
+  { id: 'ajustes',   label: 'Ajustes',   icon: '⚙️', enabled: true,  loader: () => import('./modules/ajustes.js') },
 ];
 
 const FASES = { plata: 'Fase 2', rutina: 'Fase 3', training: 'Fase 4', insights: 'Fase 5' };

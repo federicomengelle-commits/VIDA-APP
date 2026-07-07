@@ -466,8 +466,35 @@ const P11 = {
   },
 };
 
+// ---- P19 · Disciplina pareja (Rutina×Training) -----------------------------
+// Cumplís la rutina pero entrenás poco: la disciplina de la mañana no llega al gym.
+const P19 = {
+  id: 'p19',
+  titulo: 'Disciplina pareja',
+  cruza: ['rutina', 'training'],
+  tipo: 'D',
+  icono: '⚖️',
+  evaluar(ctx, U) {
+    const rut = ctx.rutina;
+    const tra = ctx.training;
+    if (!rut || rut.adherencia7 == null || !tra || tra.sesiones30 == null) return null;
+    const adh = rut.adherencia7;
+    const ses = tra.sesiones30;
+    const alta = adh >= (Number(U.adherencia_alta) || 70);
+    const pocoEntreno = ses < Math.max(1, Math.round((Number(U.training_sesiones_optimo_30) || 12) / 2));
+    if (!(alta && pocoEntreno)) return null; // solo el caso "rutina alta, gym flojo"
+    return {
+      id: this.id, titulo: this.titulo, cruza: this.cruza, tipo: this.tipo, icono: this.icono,
+      texto: `Cumplís tu rutina al ${fmtNum(adh)}% pero entrenaste ${fmtNum(ses)} ${ses === 1 ? 'vez' : 'veces'} en 30 días. Esa disciplina de la mañana te banca para llevarla al gym.`,
+      prioridad: 320,
+      dato: `Adherencia ${fmtNum(adh)}% · ${fmtNum(ses)} sesiones (30d)`,
+      accion: { label: 'Ver Training', modulo: 'training', params: { tipo: 'sesion', fecha: ctx.hoy } },
+    };
+  },
+};
+
 // Registro de palancas evaluables (orden de declaración da el orden de empate).
-const PALANCAS = [P15, P14, P2, P1, P8, P6, P11];
+const PALANCAS = [P15, P14, P2, P1, P8, P19, P6, P11];
 
 /* ============================================================================
    API pública

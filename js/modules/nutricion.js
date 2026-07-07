@@ -11,6 +11,7 @@
 import { supabase } from '../core/supabase.js';
 import { toast, confirmDialog } from '../core/ui.js';
 import { countUp, ring, stagger, tiltAll } from '../core/anim.js';
+import { getConfig } from '../core/config.js';
 
 /* ============================================================
    Fechas — helpers locales (YYYY-MM-DD local, semana desde LUNES)
@@ -75,6 +76,9 @@ const S = {
   cargando: false,
   mutandoPlan: false,      // in-flight guard de mutaciones del plan (doble tap)
   anotando: false,         // in-flight guard de inserts al log (doble tap)
+  registrandoPlata: false, // in-flight guard del egreso a Plata (doble tap)
+  guardandoPrecio: false,  // in-flight guard del update de precio de alimento
+  precioAlimentoId: null,  // id del alimento cuyo editor de precio está abierto (picker Alimentos)
   picker: null,            // { slot, tab: 'favoritos'|'combos'|'alimentos'|'manual', escala, sel }
   escala: 1,               // multiplicador de porción vigente en el picker (Cal AI)
   busca: '',
@@ -97,6 +101,44 @@ function cfgTarget() {
 function cfgAyuno() { return S.config ? S.config.get('ayuno', null) : null; }
 function cfgCompensacion() { return S.config ? S.config.get('compensacion', null) : null; }
 function cfgCreatina() { return S.config ? S.config.get('creatina', null) : null; }
+
+/* ---- Config del módulo PLATA (para el cruce Nutrición↔Plata) ----
+   Leídas vía getConfig del core (no S.config, que es el módulo nutricion).
+   Todas degradan con gracia: si falta la config de Plata, el botón
+   "Registrar en Plata" no aparece (la lista de compras sigue viva). */
+function cfgPlataMonedas() {
+  const m = getConfig('plata', 'monedas', []);
+  return Array.isArray(m) ? m.filter(x => typeof x === 'string' && x.trim()) : [];
+}
+function cfgPlataAmbitos() {
+  const a = getConfig('plata', 'ambitos', []);
+  return Array.isArray(a) ? a.filter(x => x && x.id && x.label) : [];
+}
+function cfgPlataCategoriasEgreso() {
+  const c = getConfig('plata', 'categorias', null) || {};
+  const lista = c && Array.isArray(c.egreso) ? c.egreso : [];
+  return lista.filter(x => typeof x === 'string' && x.trim());
+}
+// Moneda principal de Plata (primera de config) para valorizar el costo.
+function monedaPrincipalPlata() { const m = cfgPlataMonedas(); return m.length ? m[0] : null; }
+// ¿Está Plata configurado como para poder registrar el egreso?
+function plataDisponible() { return cfgPlataMonedas().length > 0 && cfgPlataAmbitos().length > 0; }
+
+// Categoría de comida: busca entre las categorías de egreso del usuario una que
+// matchee "comida"/"super"/"mercado" (por normalización sin acentos). Si no hay
+// ninguna, devuelve null (el egreso queda sin categoría, no rompe).
+function categoriaComidaPlata() {
+  const cats = cfgPlataCategoriasEgreso();
+  if (!cats.length) return null;
+  const norm = s => String(s == null ? '' : s).toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+  const claves = ['comida', 'super', 'supermercado', 'mercado', 'almacen', 'alimentos', 'verduleria', 'carniceria'];
+  for (const cat of cats) {
+    const cn = norm(cat);
+    if (claves.some(k => cn.includes(k))) return cat;
+  }
+  return null;
+}
 
 /* ============================================================
    Datos — Supabase (siempre .eq('user_id') + soft delete donde exista)
@@ -303,6 +345,71 @@ function resumenSemana() {
   combos.sort((a, b) => (b.veces - a.veces) || String(a.combo.nombre).localeCompare(String(b.combo.nombre)));
   const ingredientes = [...ing.values()].sort((a, b) => a.nombre.localeCompare(b.nombre));
   return { combos, ingredientes };
+}
+
+/* ============================================================
+   Cruce Nutrición↔Plata — costo estimado de la semana (BACKLOG §7)
+   ------------------------------------------------------------
+   El precio es dato del usuario (nutricion_alimentos.precio /
+   nutricion_combos.precio, en la unidad de la `porcion`). Degrada limpio:
+   un ítem sin precio simplemente no suma (queda marcado "sin precio").
+
+   Modelo honesto de costo, derivado del PLAN (no de la lista agregada por
+   nombre, porque los ingredientes de un combo son texto libre sin FK):
+     · alimento suelto planificado → precio × veces (1 porción por celda)
+     · combo planificado → SOLO si el combo tiene precio propio cargado a mano
+       (sus ingredientes free-text no se pueden valorizar uno a uno)
+   Devuelve el total + qué ítems quedaron sin precio, y un índice por clave de
+   ingrediente para anotar las filas de la lista de compras.
+   ============================================================ */
+function costoSemana() {
+  const conteoAlim = new Map();
+  const conteoCombo = new Map();
+  for (const p of S.plan) {
+    if (p.alimento_id) conteoAlim.set(p.alimento_id, (conteoAlim.get(p.alimento_id) || 0) + 1);
+    else if (p.combo_id) conteoCombo.set(p.combo_id, (conteoCombo.get(p.combo_id) || 0) + 1);
+  }
+  let total = 0;
+  let conPrecio = 0, sinPrecio = 0;
+  const porClave = new Map();   // clave de ingrediente (nombre|unidad) → costo de esa fila
+
+  // Alimentos sueltos: misma clave que arma resumenSemana para poder anotar la fila.
+  for (const [id, veces] of conteoAlim) {
+    const a = S.alimentos.find(x => x.id === id);
+    if (!a) continue;
+    const nombre = String(a.nombre).trim();
+    const unidad = a.porcion ? '× ' + String(a.porcion).trim() : 'veces';
+    const key = (nombre + '|' + unidad).toLowerCase();
+    const precio = precioNum(a.precio);
+    if (precio > 0) {
+      const costo = precio * veces;
+      total += costo;
+      conPrecio++;
+      porClave.set(key, (porClave.get(key) || 0) + costo);
+    } else {
+      sinPrecio++;
+    }
+  }
+  // Combos: solo si tienen precio propio (sus ingredientes free-text no se valorizan).
+  for (const [id, veces] of conteoCombo) {
+    const c = S.combos.find(x => x.id === id);
+    if (!c) continue;
+    const precio = precioNum(c.precio);
+    if (precio > 0) { total += precio * veces; conPrecio++; }
+    else { sinPrecio++; }
+  }
+  return { total, conPrecio, sinPrecio, porClave };
+}
+
+// Precio numérico saneado: null/undefined/negativo/NaN → 0 (no suma).
+function precioNum(v) { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; }
+
+// Formatea un monto de dinero con la moneda principal de Plata (o sin símbolo).
+function fmtDinero(monto) {
+  const m = monedaPrincipalPlata();
+  const n = Number(monto) || 0;
+  const txt = new Intl.NumberFormat('es-AR', { maximumFractionDigits: 0 }).format(Math.round(n));
+  return m ? '$' + txt + ' ' + m : '$' + txt;
 }
 
 // Items (combo_id XOR alimento_id) asignados a los slots de un día → formato
@@ -659,6 +766,99 @@ async function copiarLista() {
   }
 }
 
+/* ---- Cruce con Plata: guardar precio de un alimento (dato del usuario) ----
+   Regla de oro (CLAUDE.md §0): el precio vive en la tabla, no en el código.
+   Persiste nutricion_alimentos.precio (+ precio_moneda = moneda principal de
+   Plata si está). Optimista con rollback, igual que toggleFav. */
+async function guardarPrecioAlimento(id, precioRaw) {
+  const a = S.alimentos.find(x => x.id === id);
+  if (!a) return;
+  const limpio = String(precioRaw == null ? '' : precioRaw).trim();
+  // Vacío → borra el precio (null). Con valor → número saneado (es-AR: 1.500 / 1500,5).
+  let valor;
+  if (limpio === '') {
+    valor = null;
+  } else {
+    let s = limpio;
+    if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+    else if (/^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, '');
+    const n = Number(s);
+    if (!Number.isFinite(n) || n < 0) { toast('Poné un precio válido (0 o más)', 'warning'); return; }
+    valor = n;
+  }
+  if (S.guardandoPrecio) return; // doble tap
+  S.guardandoPrecio = true;
+  const prev = a.precio;
+  const prevMon = a.precio_moneda;
+  const moneda = monedaPrincipalPlata();
+  a.precio = valor;                                  // optimista
+  if (valor != null && moneda) a.precio_moneda = moneda;
+  S.precioAlimentoId = null;                          // cerrar el editor
+  paint();
+  try {
+    const patch = { precio: valor };
+    if (valor != null && moneda) patch.precio_moneda = moneda;
+    const { error } = await supabase.from('nutricion_alimentos').update(patch)
+      .eq('id', id).eq('user_id', S.userId);
+    if (error) throw error;
+    toast(valor == null ? 'Precio quitado' : 'Precio guardado: ' + fmtDinero(valor), 'success');
+  } catch (err) {
+    a.precio = prev;                                 // rollback
+    a.precio_moneda = prevMon;
+    toast('No se pudo guardar el precio: ' + msgErr(err), 'error');
+    paint();
+  }
+  S.guardandoPrecio = false;
+}
+
+/* ---- Cruce con Plata: registrar el costo de la semana como UN egreso ----
+   Inserta una sola fila en plata_movimientos con el costo estimado total.
+   Shape idéntico al de core/captura.js commitPlata (mismo contrato de tabla).
+   origen:'nutricion' marca la procedencia (columna es texto libre, sin CHECK).
+   Guard anti doble-tap: S.registrandoPlata. */
+async function registrarEnPlata() {
+  if (S.registrandoPlata) return;
+  if (!plataDisponible()) { toast('Configurá Plata (monedas y ámbitos) para registrar el gasto', 'warning'); return; }
+  const { total, conPrecio } = costoSemana();
+  if (!(total > 0) || !conPrecio) { toast('No hay ítems con precio para registrar', 'warning'); return; }
+  const moneda = monedaPrincipalPlata();
+  const ambitos = cfgPlataAmbitos();
+  const ambito = ambitos.length ? ambitos[0].id : null;
+  if (!moneda || !ambito) { toast('Falta moneda o ámbito en la config de Plata', 'warning'); return; }
+
+  const ok = await confirmDialog({
+    title: 'Registrar en Plata',
+    message: 'Cargar un egreso de ' + fmtDinero(total) + ' (compras de la semana del '
+      + labelCorto(S.semana) + ' al ' + labelCorto(addDias(S.semana, 6)) + ') en Plata?',
+    confirmText: 'Registrar',
+  });
+  if (!ok) return;
+
+  S.registrandoPlata = true;
+  paint(); // el botón pasa a estado "registrando" (deshabilitado)
+  try {
+    const fila = {
+      user_id: S.userId,
+      fecha: hoyStr(),
+      tipo: 'egreso',
+      monto: Math.round(total * 100) / 100,          // 2 decimales, coherente con numeric
+      moneda,
+      ambito,
+      categoria: categoriaComidaPlata(),             // categoría de comida o null
+      descripcion: 'Compras de la semana',
+      origen: 'nutricion',
+      crudo: 'Compras de la semana del ' + labelCorto(S.semana) + ' al ' + labelCorto(addDias(S.semana, 6)),
+    };
+    const { error } = await supabase.from('plata_movimientos').insert(fila);
+    if (error) throw error;
+    toast('Registrado en Plata: ' + fmtDinero(total), 'success');
+  } catch (err) {
+    toast('No se pudo registrar en Plata: ' + msgErr(err), 'error');
+  }
+  S.registrandoPlata = false;
+  paint();
+}
+
 /* ============================================================
    Eventos — delegación en el container (se bindea UNA vez)
    ============================================================ */
@@ -688,6 +888,7 @@ function onEscape(e) {
   if (!S.container || !S.container.isConnected) return;
   if (S.plantillaModal) { S.plantillaModal = null; paint(); }
   else if (S.comboPicker) { S.comboPicker = null; paint(); }
+  else if (S.precioAlimentoId) { S.precioAlimentoId = null; paint(); }
   else if (S.picker) { S.picker = null; paint(); }
 }
 
@@ -697,7 +898,7 @@ function onClick(e) {
   const a = el.dataset.action;
 
   if (a === 'tab') {
-    S.tab = el.dataset.tab; S.picker = null; S.comboPicker = null; S.plantillaModal = null;
+    S.tab = el.dataset.tab; S.picker = null; S.comboPicker = null; S.plantillaModal = null; S.precioAlimentoId = null;
     // Al volver a Hoy después de navegar semanas: reenganchar el plan a la
     // semana del día visible para que el chip "Planificado" resuelva bien.
     if (S.tab === 'hoy' && lunesDe(S.fecha) !== S.semana) {
@@ -711,15 +912,17 @@ function onClick(e) {
   if (a === 'dia-next') { cambiarDia(addDias(S.fecha, 1)); return; }
   if (a === 'dia-hoy') { cambiarDia(hoyStr()); return; }
 
-  if (a === 'abrir-picker') { S.picker = { slot: el.dataset.slot, tab: 'favoritos' }; S.busca = ''; S.escala = 1; paint(); return; }
-  if (a === 'cerrar-picker') { S.picker = null; paint(); return; }
-  if (a === 'picker-tab') { if (S.picker) { S.picker.tab = el.dataset.ptab; S.busca = ''; paint(); } return; }
+  if (a === 'abrir-picker') { S.picker = { slot: el.dataset.slot, tab: 'favoritos' }; S.busca = ''; S.escala = 1; S.precioAlimentoId = null; paint(); return; }
+  if (a === 'cerrar-picker') { S.picker = null; S.precioAlimentoId = null; paint(); return; }
+  if (a === 'picker-tab') { if (S.picker) { S.picker.tab = el.dataset.ptab; S.busca = ''; S.precioAlimentoId = null; paint(); } return; }
   if (a === 'escala') { S.escala = Number(el.dataset.f) || 1; paint(); return; }
 
   if (a === 'add-alimento') { addAlimento(el.dataset.id); return; }
   if (a === 'add-combo') { addCombo(el.dataset.id); return; }
   if (a === 'fav') { toggleFav(el.dataset.tipo, el.dataset.id); return; }
   if (a === 'del-log') { borrarEntrada(el.dataset.id); return; }
+  if (a === 'precio-abrir') { S.precioAlimentoId = el.dataset.id; paint(); const inp = document.getElementById('nutPrecioInput'); if (inp) { inp.focus(); inp.select(); } return; }
+  if (a === 'precio-cerrar') { S.precioAlimentoId = null; paint(); return; }
 
   if (a === 'sem-prev') { cambiarSemana(addDias(S.semana, -7)); return; }
   if (a === 'sem-next') { cambiarSemana(addDias(S.semana, 7)); return; }
@@ -745,6 +948,7 @@ function onClick(e) {
   if (a === 'plantilla-borrar') { borrarPlantilla(el.dataset.id); return; }
 
   if (a === 'copiar') { copiarLista(); return; }
+  if (a === 'registrar-plata') { registrarEnPlata(); return; }
   if (a === 'ir-semana') { S.tab = 'semana'; paint(); return; }
 }
 
@@ -756,6 +960,13 @@ function onSubmit(e) {
     const nombre = String(new FormData(form).get('nombre') || '').trim();
     if (!nombre) { toast('Poné un nombre para la plantilla', 'warning'); return; }
     guardarPlantilla(nombre);
+    return;
+  }
+  if (form.dataset.action === 'guardar-precio') {
+    e.preventDefault();
+    const id = form.dataset.id;
+    const precio = String(new FormData(form).get('precio') || '');
+    guardarPrecioAlimento(id, precio);
     return;
   }
   if (form.dataset.action !== 'manual') return;
@@ -1096,14 +1307,33 @@ function escalaHTML() {
 
 // factor: multiplicador de porción vigente (1 salvo que el picker escale).
 // Muestra el macro ESCALADO (lo que se va a guardar) para que el tap sea fiel.
-function filaAlimento(a, factor = 1) {
+// opts.conPrecio: en la pestaña "Alimentos" muestra el precio por porción y
+// permite editarlo (cruce con Plata). En favoritos/plan queda apagado.
+function filaAlimento(a, factor = 1, opts = {}) {
   const f = Number(factor) || 1;
   const prot = (Number(a.prot) || 0) * f, kcal = (Number(a.kcal) || 0) * f;
+  const precio = precioNum(a.precio);
+  const editando = opts.conPrecio && S.precioAlimentoId === a.id;
+  const chipPrecio = opts.conPrecio ? (
+    editando
+      ? `<form class="nut-precio-form" data-action="guardar-precio" data-id="${esc(a.id)}">
+           <span class="nut-precio-sim">${monedaPrincipalPlata() ? '$' : '$'}</span>
+           <input id="nutPrecioInput" class="nut-input nut-precio-input" name="precio" type="text" inputmode="decimal"
+             value="${precio > 0 ? esc(precio) : ''}" placeholder="precio" autocomplete="off" aria-label="Precio de ${esc(a.nombre)}">
+           <button type="submit" class="nut-precio-ok" aria-label="Guardar precio">✓</button>
+           <button type="button" class="nut-precio-cancel" data-action="precio-cerrar" aria-label="Cancelar">✕</button>
+         </form>`
+      : `<button class="nut-precio-chip${precio > 0 ? ' nut-precio-set' : ''}" data-action="precio-abrir" data-id="${esc(a.id)}"
+           aria-label="${precio > 0 ? 'Editar precio' : 'Poner precio'}" title="Precio por porción (para el gasto de compras)">
+           ${precio > 0 ? '💲 ' + esc(fmtDinero(precio)) : '💲 precio'}
+         </button>`
+  ) : '';
   return `
-  <div class="nut-item" data-action="add-alimento" data-id="${esc(a.id)}" role="button" tabindex="0">
+  <div class="nut-item${editando ? ' nut-item-editando' : ''}" data-action="add-alimento" data-id="${esc(a.id)}" role="button" tabindex="0">
     <div class="nut-item-info">
       <div class="nut-item-nombre">${esc(a.nombre)}${a.porcion ? ` <span class="nut-item-porcion">${esc(a.porcion)}${f !== 1 ? ' ×' + num(f) : ''}</span>` : (f !== 1 ? ` <span class="nut-item-porcion">×${num(f)}</span>` : '')}</div>
       <div class="nut-item-macros"><span class="nut-num">${num(prot)}</span> g prot · ${num(kcal)} kcal</div>
+      ${chipPrecio}
     </div>
     <button class="nut-icono nut-star${a.favorito ? ' activa' : ''}" data-action="fav" data-tipo="alimento" data-id="${esc(a.id)}" aria-label="Marcar favorito">${a.favorito ? '★' : '☆'}</button>
   </div>`;
@@ -1156,7 +1386,7 @@ function listaAlimentosHTML() {
       ? 'No encontré nada con esa búsqueda.'
       : 'No hay alimentos cargados. Corré el seed (sql/02_seed_nutricion.sql).'}</div>`;
   }
-  return items.map(a => filaAlimento(a, S.escala)).join('');
+  return items.map(a => filaAlimento(a, S.escala, { conPrecio: true })).join('');
 }
 
 function pickerManual() {
@@ -1371,13 +1601,51 @@ function vistaPrep() {
 }
 
 /* ---------- Tab COMPRAS ---------- */
+// Panel de costo estimado (cruce Nutrición↔Plata, BACKLOG §7). Barra viva de
+// cobertura de precios + botón "Registrar en Plata". Degrada limpio: sin
+// precios cargados, muestra un llamado a poner precios y no ofrece registrar.
+function panelCostoCompras(costo) {
+  const { total, conPrecio, sinPrecio } = costo;
+  const totalItems = conPrecio + sinPrecio;
+  const pct = totalItems > 0 ? Math.round((conPrecio / totalItems) * 100) : 0;
+  const puedeRegistrar = plataDisponible() && total > 0 && conPrecio > 0;
+  const registrando = S.registrandoPlata;
+
+  const detalle = totalItems === 0
+    ? 'Ponés precios en la pestaña Alimentos y esto se llena solo'
+    : (sinPrecio > 0
+      ? `${conPrecio} con precio · ${sinPrecio} sin precio (no suman)`
+      : `${conPrecio} ítem${conPrecio > 1 ? 's' : ''} con precio`);
+
+  return `
+  <div class="nut-card nut-costo rise lively" data-tilt>
+    <div class="nut-costo-head">
+      <span class="nut-cap">Costo estimado de la semana</span>
+      <span class="nut-costo-monto nut-num" data-count="${Math.round(total)}" data-suffix="" data-dec="0">0</span>
+      ${monedaPrincipalPlata() ? `<span class="nut-costo-moneda">${esc(monedaPrincipalPlata())}</span>` : ''}
+    </div>
+    <div class="nut-costo-barra" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100" aria-label="Cobertura de precios">
+      <div class="nut-costo-fill" style="width:${pct}%"></div>
+    </div>
+    <div class="nut-costo-detalle">${esc(detalle)}</div>
+    ${puedeRegistrar
+      ? `<button class="nut-btn-primario nut-costo-btn${registrando ? ' nut-costo-btn-busy' : ''}" data-action="registrar-plata"${registrando ? ' disabled' : ''}>
+           ${registrando ? 'Registrando…' : '💵 Registrar en Plata'}
+         </button>`
+      : (total > 0 && !plataDisponible()
+        ? `<div class="nut-costo-nota">Configurá Plata (monedas y ámbitos) para poder registrar este gasto.</div>`
+        : '')}
+  </div>`;
+}
+
 function vistaCompras() {
   const nav = navSemana();
   if (S.cargando) return nav + `<div class="nut-cargando">Cargando la semana…</div>`;
   const { ingredientes } = resumenSemana();
   if (!ingredientes.length) return nav + vacioPlan();
   const estado = comprasEstado();
-  return nav + `
+  const costo = costoSemana();
+  return nav + panelCostoCompras(costo) + `
   <div class="nut-card nut-compras rise">
     <header class="nut-compras-head">
       <div>
@@ -1389,11 +1657,17 @@ function vistaCompras() {
     ${ingredientes.map(i => {
       const key = claveIngrediente(i);
       const marcado = !!estado[key];
+      // Costo de la fila si el ingrediente proviene de un alimento con precio
+      // (los ingredientes de combo son texto libre → sin precio individual).
+      const lineCost = costo.porClave.get(key);
+      const costoTxt = lineCost > 0
+        ? `<span class="nut-compra-costo">${esc(fmtDinero(lineCost))}</span>`
+        : `<span class="nut-compra-sinprecio">sin precio</span>`;
       return `
       <label class="nut-compra${marcado ? ' nut-comprado' : ''}">
         <input type="checkbox" class="nut-check" data-action="compra" data-key="${esc(key)}"${marcado ? ' checked' : ''}>
         <span class="nut-compra-nombre">${esc(i.nombre)}</span>
-        <span class="nut-compra-cant"><span class="nut-num">${num(i.cantidad)}</span> ${esc(i.unidad)}</span>
+        <span class="nut-compra-cant"><span class="nut-num">${num(i.cantidad)}</span> ${esc(i.unidad)}${costoTxt}</span>
       </label>`;
     }).join('')}
   </div>`;
@@ -1589,9 +1863,39 @@ const CSS = `
 .nut-compra:last-child { border-bottom: none; }
 .nut-check { width: 22px; height: 22px; flex: none; accent-color: var(--accent); cursor: pointer; }
 .nut-compra-nombre { flex: 1; font-size: .92rem; overflow-wrap: anywhere; }
-.nut-compra-cant { font-size: .85rem; color: var(--text-dim); white-space: nowrap; }
+.nut-compra-cant { display: inline-flex; align-items: baseline; gap: var(--space-2); font-size: .85rem; color: var(--text-dim); white-space: nowrap; }
+.nut-compra-costo { font-family: var(--font-num); font-variant-numeric: tabular-nums; font-weight: 700; color: var(--accent-2); }
+.nut-compra-sinprecio { font-size: .68rem; text-transform: uppercase; letter-spacing: .04em; color: var(--text-faint); }
 .nut-comprado .nut-compra-nombre { text-decoration: line-through; color: var(--text-faint); }
-.nut-comprado .nut-compra-cant { color: var(--text-faint); }
+.nut-comprado .nut-compra-cant, .nut-comprado .nut-compra-costo { color: var(--text-faint); }
+
+/* Costo estimado de la semana (cruce Nutrición↔Plata) */
+.nut-costo { background: linear-gradient(135deg, color-mix(in srgb, var(--accent-2) 8%, transparent), transparent), var(--surface); border-color: var(--border-strong); }
+.nut-costo-head { display: flex; align-items: baseline; gap: var(--space-2); flex-wrap: wrap; margin-bottom: var(--space-3); }
+.nut-costo-head .nut-cap { flex: 1 1 100%; }
+.nut-costo-monto { font-size: 2rem; font-weight: 800; color: var(--text); line-height: 1; }
+.nut-costo-monto::before { content: "$"; font-size: 1.2rem; font-weight: 700; color: var(--text-dim); margin-right: 2px; }
+.nut-costo-moneda { font-size: .82rem; font-weight: 700; color: var(--text-dim); font-family: var(--font-num); }
+.nut-costo-barra { height: 8px; border-radius: 999px; background: var(--surface-2); overflow: hidden; margin-bottom: var(--space-2); }
+.nut-costo-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width var(--dur-slow) var(--ease-out-expo); }
+.nut-costo-detalle { font-size: .78rem; color: var(--text-faint); }
+.nut-costo-btn { width: 100%; margin-top: var(--space-3); }
+.nut-costo-btn-busy { opacity: .7; cursor: default; }
+.nut-costo-nota { margin-top: var(--space-3); font-size: .78rem; color: var(--text-faint); padding: var(--space-2) var(--space-3); background: var(--surface-2); border-radius: var(--radius-sm); border-left: 3px solid var(--accent-2); }
+
+/* Precio por porción en el picker de Alimentos */
+.nut-item-editando { background: var(--accent-2-soft); }
+.nut-precio-chip { margin-top: 4px; display: inline-flex; align-items: center; min-height: 30px; padding: 3px var(--space-2); background: var(--surface-2); border: 1px dashed var(--border-strong); border-radius: 999px; font-size: .72rem; color: var(--text-dim); transition: color .15s, border-color .15s, background .15s; }
+.nut-precio-chip:hover { color: var(--accent-2); border-color: var(--accent-2); background: var(--accent-2-soft); }
+.nut-precio-set { border-style: solid; border-color: color-mix(in srgb, var(--accent-2) 45%, transparent); color: var(--accent-2); font-family: var(--font-num); font-weight: 700; }
+.nut-precio-form { margin-top: 4px; display: inline-flex; align-items: center; gap: 4px; }
+.nut-precio-sim { font-size: .82rem; color: var(--text-dim); font-family: var(--font-num); }
+.nut-precio-input { width: 96px; min-height: 36px; padding: 4px var(--space-2); font-family: var(--font-num); }
+.nut-precio-ok, .nut-precio-cancel { width: 36px; min-height: 36px; flex: none; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); font-size: .9rem; }
+.nut-precio-ok { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.nut-precio-ok:hover { background: var(--accent-soft); }
+.nut-precio-cancel { color: var(--text-faint); }
+.nut-precio-cancel:hover { background: var(--surface-2); color: var(--text-dim); }
 
 /* Vacíos y cargando */
 .nut-vacio { padding: var(--space-8) var(--space-4); text-align: center; color: var(--text-dim); }
@@ -1646,6 +1950,7 @@ export default {
     S.picker = null;
     S.comboPicker = null;
     S.plantillaModal = null;
+    S.precioAlimentoId = null;
     inyectarEstilos();
     bind();
     if (!supabase) {
