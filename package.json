@@ -1,0 +1,10 @@
+{
+  "name": "vida-app",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "VIDA — OS personal. Front estático (Vanilla JS) + serverless /api (Vercel).",
+  "dependencies": {
+    "@anthropic-ai/sdk": "latest"
+  }
+}

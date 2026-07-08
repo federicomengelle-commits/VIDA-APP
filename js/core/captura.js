@@ -3,11 +3,12 @@
 // la entiende, muestra qué entendió para confirmar/editar, y la inserta en el
 // módulo correcto. Contrato VINCULANTE: docs/CONTRATOS.md §15.
 //
-// SEAM DE IA (Fase 5b): el ÚNICO punto que cambia cuando llegue la
-// ANTHROPIC_API_KEY es `interpretar(texto)`. Hoy es un parser determinístico
-// es-AR; mañana será `await fetch('/api/parse', ...)` que devuelve la MISMA
-// forma de propuesta. La UI (overlay, card de confirmación) y los inserts
-// (commit) NO se tocan. Por eso `interpretar` está aislado y documentado.
+// SEAM DE IA (Fase 5b · ACTIVO): `interpretar(texto)` intenta primero el
+// cerebro serverless (`/api/parse` → Claude Sonnet 4.6); si no está la
+// ANTHROPIC_API_KEY o falla, cae al parser determinístico es-AR. Los dos
+// caminos devuelven la MISMA forma de propuesta, y el GROUNDING (IDs + macros
+// reales) lo hace el cliente contra el catálogo (nada inventado, BACKLOG §7).
+// La UI (overlay, card de confirmación) y los inserts (commit) NO se tocan.
 //
 // SEGURIDAD: nunca auto-commitea. Toda propuesta pasa por la card de
 // confirmación editable. Aunque el parser v0 se equivoque, el usuario revisa.
@@ -356,13 +357,281 @@ async function cargarCatalogos() {
 /* ============================================================
    EL SEAM DE IA · interpretar(texto) → propuesta
    ------------------------------------------------------------
-   Único punto que cambia en Fase 5b. Contrato de retorno:
+   Fase 5b ACTIVA. Orden: (1) intenta el cerebro serverless /api/parse
+   (Claude Sonnet 4.6) que ENTIENDE/segmenta la frase; el cliente hace el
+   GROUNDING (resuelve IDs + macros reales contra el catálogo del usuario,
+   nada inventado). (2) Si el endpoint no está (sin API key → 501, o error /
+   timeout) cae al parser determinístico es-AR. Ambos caminos devuelven el
+   MISMO contrato:
      { modulo, confianza:'alta'|'media'|'baja', campos, resumen, crudo }
-   o { modulo: null, crudo } si no pudo determinar intención.
+   o { modulo: null, crudo } si no se pudo determinar intención.
    `campos` es específico por módulo (ver commit()).
-   Determinístico, es-AR, normaliza sin acentos.
    ============================================================ */
 async function interpretar(texto) {
+  const crudo = String(texto || '').trim();
+  if (!crudo) return { modulo: null, crudo };
+  await cargarCatalogos();
+  try {
+    const ia = await interpretarIA(crudo);
+    if (ia && ia.modulo) return ia;          // la IA entendió y quedó grounded
+  } catch (_) { /* endpoint ausente/erróneo/timeout → parser determinístico */ }
+  return interpretarDet(crudo);
+}
+
+/* ---- IA: llama al cerebro (Claude vía serverless) y hace grounding ----
+   Devuelve una propuesta ya grounded o null (→ el caller cae al determinístico).
+   NO inserta nada (eso lo hace commit() tras la confirmación del usuario). */
+async function interpretarIA(crudo) {
+  const payload = {
+    texto: crudo,
+    config: {
+      slots: cfgSlots(),
+      monedas: cfgMonedas(),
+      ambitos: cfgAmbitos(),
+      categorias: { egreso: cfgCategorias('egreso'), ingreso: cfgCategorias('ingreso') },
+    },
+  };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12000); // fallback si el endpoint cuelga
+  let res;
+  try {
+    res = await fetch('/api/parse', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    });
+  } finally { clearTimeout(timer); }
+  if (!res.ok) throw new Error('parse ' + res.status); // 501 sin key / 5xx → fallback
+  const data = await res.json();                        // HTML (preview sin /api) → throw → fallback
+  if (!data || !data.modulo || data.modulo === 'ninguno') return null;
+  return groundPropuesta(data, crudo);
+}
+
+// Convierte el "entendimiento" de la IA en una propuesta con IDs/macros reales.
+function groundPropuesta(data, crudo) {
+  const n = norm(crudo);
+  if (data.modulo === 'plata')     return groundPlata(data, n, crudo);
+  if (data.modulo === 'nutricion') return groundNutricion(data, n, crudo);
+  if (data.modulo === 'training')  return groundTraining(data, n, crudo);
+  if (data.modulo === 'rutina')    return groundRutina(data, n, crudo);
+  return null;
+}
+
+/* ---- Grounding: Plata ---- */
+function groundPlata(data, n, crudo) {
+  const p = data.plata || {};
+  const tipo = (p.tipo === 'ingreso' || p.tipo === 'egreso') ? p.tipo : 'egreso';
+  const montoNum = Number(p.monto);
+  const monto = (Number.isFinite(montoNum) && montoNum > 0) ? montoNum : null;
+  const moneda = mapMoneda(p.moneda);
+  const ambito = mapAmbito(p.ambito, n);
+  const categoria = mapCategoria(p.categoria, n, tipo);
+  const fecha = resolverFechaIA(p.fecha, n);
+  const descripcion = (typeof p.descripcion === 'string') ? p.descripcion.trim() : '';
+  let confianza;
+  if (monto && categoria) confianza = 'alta';
+  else if (monto) confianza = 'media';
+  else confianza = 'baja';
+  return {
+    modulo: 'plata', confianza,
+    campos: {
+      tipo,
+      monto: monto != null ? monto : '',
+      moneda, ambito,
+      categoria: categoria || '',
+      descripcion,
+      fecha,
+    },
+    resumen: (tipo === 'ingreso' ? 'Ingreso' : 'Egreso')
+      + (monto != null ? ' de ' + monto + ' ' + moneda : '')
+      + (categoria ? ' · ' + categoria : '')
+      + ' · ' + labelAmbito(ambito),
+    crudo,
+  };
+}
+function mapMoneda(m) {
+  const monedas = cfgMonedas();
+  if (typeof m === 'string' && m.trim() && monedas.length) {
+    const mn = norm(m);
+    const hit = monedas.find(x => norm(x) === mn)
+             || monedas.find(x => norm(x).includes(mn) || mn.includes(norm(x)));
+    if (hit) return hit;
+  }
+  return primeraMoneda();
+}
+function mapAmbito(a, n) {
+  const ambitos = cfgAmbitos();
+  if (typeof a === 'string' && a.trim() && ambitos.length) {
+    const an = norm(a);
+    const hit = ambitos.find(x => norm(x.id) === an || norm(x.label) === an)
+             || ambitos.find(x => norm(x.label).includes(an) || an.includes(norm(x.id)));
+    if (hit) return hit.id;
+  }
+  return matchAmbito(n); // fallback determinístico sobre el crudo
+}
+function mapCategoria(c, n, tipo) {
+  const validas = cfgCategorias(tipo);
+  if (typeof c === 'string' && c.trim() && validas.length) {
+    const cn = norm(c);
+    const hit = validas.find(v => norm(v) === cn)
+             || validas.find(v => norm(v).includes(cn) || cn.includes(norm(v)));
+    if (hit) return hit;
+  }
+  return matchCategoria(n, tipo) || '';
+}
+function resolverFechaIA(f, n) {
+  if (typeof f === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(f.trim())) return f.trim();
+  return resolverFecha(n); // 'hoy'/'ayer'/relativas → resolver sobre el crudo
+}
+
+/* ---- Grounding: Nutrición ---- */
+function groundNutricion(data, n, crudo) {
+  const nut = data.nutricion || {};
+  const slots = cfgSlots();
+  let slot = null;
+  if (typeof nut.slot === 'string' && nut.slot.trim()) {
+    const sn = norm(nut.slot);
+    slot = slots.find(s => norm(s.id) === sn || norm(s.label) === sn)
+        || slots.find(s => norm(s.label).includes(sn) || sn.includes(norm(s.id)));
+  }
+  if (!slot) { const sv = slotPorVerbo(n); slot = slots.find(s => s.id === sv) || null; }
+  if (!slot) slot = slots[0] || null;
+  const slotId = slot ? slot.id : 'almuerzo';
+  const fecha = resolverFecha(n);
+
+  const items = [];
+  const itemsIn = Array.isArray(nut.items) ? nut.items : [];
+  for (const it of itemsIn) {
+    const nombre = (it && typeof it.nombre === 'string') ? it.nombre.trim() : '';
+    if (!nombre) continue;
+    const g = Number(it.gramos), c = Number(it.cantidad);
+    items.push(resolverItemNutricion(nombre,
+      (Number.isFinite(g) && g > 0) ? g : null,
+      (Number.isFinite(c) && c > 0) ? c : null));
+  }
+  if (!items.length) {
+    // La IA dijo nutrición pero no listó items → entrada manual con el crudo.
+    items.push({ tipo: 'custom', id: null, nombre: crudo, cantidad: 1, prot: 0, carbo: 0, grasa: 0, kcal: 0 });
+  }
+  const hayReal = items.some(i => i.tipo !== 'custom');
+  const totalProt = items.reduce((s, it) => s + it.prot, 0);
+  return {
+    modulo: 'nutricion',
+    confianza: hayReal ? 'alta' : 'baja',
+    campos: { slot: slotId, fecha, items },
+    resumen: (slot ? slot.label : slotId) + ': '
+      + items.map(it => (it.cantLabel && it.cantLabel !== 1 ? it.cantLabel + (typeof it.cantLabel === 'number' ? '× ' : ' ') : '') + it.nombre).join(', ')
+      + ' · ' + Math.round(totalProt) + ' g prot',
+    crudo,
+  };
+}
+// Resuelve un nombre libre contra el catálogo (combos → alimentos) y escala
+// macros por gramos/cantidad. Sin match → item custom (macros 0). Espeja matchComida.
+function resolverItemNutricion(nombre, gramos, cantidad) {
+  const nn = norm(nombre);
+  for (const c of CAT.combos) {
+    const nom = norm(c.nombre);
+    if (nom && nom.length >= 3 && (nn.includes(nom) || nom.includes(nn))) {
+      const f = (cantidad && cantidad > 0) ? cantidad : 1;
+      return { tipo: 'combo', id: c.id, nombre: c.nombre, cantidad: f,
+        prot: num(c.prot) * f, carbo: num(c.carbo) * f, grasa: num(c.grasa) * f, kcal: num(c.kcal) * f };
+    }
+  }
+  for (const a of CAT.alimentos) {
+    const nom = norm(a.nombre);
+    if (!nom || nom.length < 3) continue;
+    const primera = nom.split(' ')[0];
+    if (!(nn.includes(nom) || nom.includes(nn) || (primera.length >= 3 && nn.includes(primera)))) continue;
+    const pg = gramosDePorcion(a.porcion);
+    let factor;
+    if (pg > 0 && gramos != null) factor = gramos / pg;
+    else if (cantidad != null) factor = cantidad;
+    else factor = 1;
+    if (!(factor > 0)) factor = 1;
+    const cantLabel = (pg > 0 && factor !== 1) ? Math.round(pg * factor) + ' g' : factor;
+    return { tipo: 'alimento', id: a.id,
+      nombre: a.porcion ? a.nombre + ' (' + a.porcion + ')' : a.nombre,
+      cantidad: typeof cantLabel === 'number' ? cantLabel : 1, cantLabel,
+      prot: num(a.prot) * factor, carbo: num(a.carbo) * factor, grasa: num(a.grasa) * factor, kcal: num(a.kcal) * factor };
+  }
+  return { tipo: 'custom', id: null, nombre, cantidad: cantidad || 1, prot: 0, carbo: 0, grasa: 0, kcal: 0 };
+}
+
+/* ---- Grounding: Training ---- */
+function groundTraining(data, n, crudo) {
+  const tr = data.training || {};
+  const nombreIA = (typeof tr.ejercicio === 'string') ? tr.ejercicio.trim() : '';
+  const ej = resolverEjercicio(nombreIA);
+  const nombre = ej ? ej.nombre : nombreIA;
+  const tablaAusente = CAT.errores.training;
+  const sets = (Array.isArray(tr.sets) ? tr.sets : [])
+    .map(s => ({ peso: num(s && s.peso), reps: Math.max(0, Math.round(Number(s && s.reps) || 0)) }))
+    .filter(s => s.reps > 0 || s.peso > 0);
+  if (!sets.length) {
+    return {
+      modulo: 'training', confianza: 'baja',
+      campos: { ejercicio_id: ej ? ej.id : null, ejercicio_nombre: nombre, sets: [] },
+      resumen: (nombre || 'Ejercicio') + ': completá las series'
+        + (tablaAusente ? ' (¿corriste sql/06?)' : ''),
+      crudo,
+    };
+  }
+  let confianza;
+  if (tablaAusente) confianza = 'baja';
+  else if (ej && sets.length) confianza = 'alta';
+  else confianza = 'media';
+  return {
+    modulo: 'training', confianza,
+    campos: { ejercicio_id: ej ? ej.id : null, ejercicio_nombre: nombre, sets },
+    resumen: (nombre || 'Ejercicio') + ': ' + sets.length + '×' + (sets[0] ? sets[0].reps : 0)
+      + (sets[0] && sets[0].peso ? ' con ' + sets[0].peso + ' kg' : ''),
+    crudo,
+  };
+}
+function resolverEjercicio(nombre) {
+  const nn = norm(nombre);
+  if (!nn) return null;
+  for (const e of CAT.ejercicios) {
+    const nom = norm(e.nombre);
+    if (!nom) continue;
+    const primera = nom.split(' ')[0];
+    if (nn.includes(nom) || nom.includes(nn) || (primera.length >= 4 && nn.includes(primera))) return e;
+  }
+  return null;
+}
+
+/* ---- Grounding: Rutina ---- */
+function groundRutina(data, n, crudo) {
+  // Los IDs de hábito viven en el catálogo → resolvemos contra las rutinas
+  // activas por el crudo (y por las frases que aportó la IA, si hiciera falta).
+  let checks = matchHabito(n);
+  if (!checks.length) {
+    const frases = (data.rutina && Array.isArray(data.rutina.items)) ? data.rutina.items : [];
+    const vistos = new Set();
+    for (const f of frases) {
+      for (const c of matchHabito(norm(String(f || '')))) {
+        const k = c.rutina_id + '|' + c.item_id;
+        if (!vistos.has(k)) { vistos.add(k); checks.push(c); }
+      }
+    }
+  }
+  if (!checks.length) return null; // nada matcheó → que caiga al determinístico
+  return {
+    modulo: 'rutina', confianza: 'alta',
+    campos: { fecha: resolverFecha(n), checks },
+    resumen: 'Marcar: ' + checks.map(c => c.label).join(', '),
+    crudo,
+  };
+}
+
+/* ============================================================
+   PARSER DETERMINÍSTICO · interpretarDet(texto) → propuesta
+   ------------------------------------------------------------
+   Fallback sin API key (idéntico al motor v0). Mismo contrato de retorno
+   que interpretar(). es-AR, normaliza sin acentos.
+   ============================================================ */
+async function interpretarDet(texto) {
   const crudo = String(texto || '').trim();
   if (!crudo) return { modulo: null, crudo };
   await cargarCatalogos();

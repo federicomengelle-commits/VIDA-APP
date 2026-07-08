@@ -16,12 +16,14 @@
 
 ## 3. Pendiente de Fede (hacer cuando pueda)
 
-1. **Correr 2 SQL** en Supabase (SQL Editor → pegar → Run; idempotentes):
+1. **Correr los SQL pendientes** en Supabase (SQL Editor → pegar → Run; idempotentes, safe re-correr):
    - `sql/07_precio_alimentos.sql` → activa el cruce Nutrición↔Plata.
    - `sql/08_cuerpo_metricas.sql` → activa el módulo Cuerpo.
-   - (Recordatorio viejo: `sql/06_training.sql` — confirmar si ya se corrió; activa Training con datos.)
+   - `sql/09_seed_alimentos_ar.sql` → **NUEVO**: 39 alimentos argentinos (macros reales + precio ARS jul-2026). Auto-agrega columnas de precio, así que no depende de que 07 haya corrido.
+   - `sql/10_seed_ejercicios.sql` → **NUEVO**: 51 ejercicios por grupo muscular. **Requiere que `sql/06` ya haya corrido** (usa la tabla + config de Training); si no, avisa con un error claro.
+   - (Recordatorio viejo: `sql/06_training.sql` — confirmar si ya se corrió; activa Training con datos y es prerequisito de 10.)
 2. **Mirar el deploy** y reportar qué se ve raro con datos reales.
-3. **Traer `ANTHROPIC_API_KEY`** (env var en Vercel) cuando quiera arrancar la **Ola 3 IA** (foto→macros, coach, captura con Claude).
+3. **Ola 3 IA — captura por voz con Claude (EN CURSO, 2026-07-07).** `ANTHROPIC_API_KEY` ya seteada en Vercel (env var Sensitive, Production + Preview). Modelo elegido: **`claude-sonnet-4-6`** (por costo). Se construyó: `api/parse.js` (serverless), `package.json` (raíz), y `js/core/captura.js` cableado AI-first con fallback determinístico. **Falta:** push a `main` → autodeploy (Vercel instala la dep + compila `/api`) → probar en prod. Frases de prueba: "gasté 5 lucas en el súper", "almorcé 250 de carne y 2 huevos", "press banca 4x10 con 80", "tomé la creatina". Si el sitio 404ea tras el deploy, agregar un `vercel.json` mínimo (el `package.json` cambia cómo Vercel buildea). Próximo: **foto→macros** (Claude visión) sobre el mismo `/api`.
 
 ## 4. PRÓXIMO OBJETIVO (para la charla nueva): SEEDS de datos reales
 
