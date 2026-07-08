@@ -1084,6 +1084,126 @@ async function entender() {
   pintarOverlay();
 }
 
+/* ============================================================
+   Foto al plato → macros (Ola 3 · Claude visión, mismo /api base)
+   ------------------------------------------------------------
+   La foto se lee, se achica en el cliente (payload liviano) y se manda a
+   /api/foto; Claude identifica y ESTIMA porciones (nunca inventa macros). El
+   grounding (IDs + macros reales) lo hace resolverItemNutricion contra el
+   catálogo. Produce una propuesta de Nutrición → misma card de confirmación,
+   commit y undo que la captura por voz/texto. Sin /api (o sin key) → avisa.
+   ============================================================ */
+function elegirFoto() {
+  if (O.interpretando) return;
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.setAttribute('capture', 'environment'); // en mobile abre la cámara trasera
+  input.style.display = 'none';
+  input.addEventListener('change', () => {
+    const file = input.files && input.files[0];
+    input.remove();
+    if (file) procesarFoto(file);
+  });
+  document.body.appendChild(input);
+  input.click();
+}
+
+async function procesarFoto(file) {
+  if (!/^image\//.test(file.type || '')) { toast('Eso no parece una imagen', 'warning'); return; }
+  origenUltimo = 'foto';
+  O.interpretando = true;
+  setFabEstado('pensando');
+  pintarOverlay();
+  try {
+    await cargarCatalogos();
+    const dataUrl = await imagenADataUrl(file, 1024);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 30000); // la visión tarda más que el texto
+    let res;
+    try {
+      res = await fetch('/api/foto', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imagen: dataUrl, config: { slots: cfgSlots() } }),
+        signal: ctrl.signal,
+      });
+    } finally { clearTimeout(timer); }
+    if (!res.ok) throw new Error('foto ' + res.status); // 501 sin key / 5xx
+    const data = await res.json();
+    const items = (data && Array.isArray(data.items)) ? data.items : [];
+    if (!items.length) toast('No reconocí comida en la foto · probá otra o cargala a mano', 'warning');
+    O.propuesta = propuestaDesdeFoto(items, data && data.slot, data && data.nota);
+  } catch (err) {
+    O.propuesta = null;
+    toast('No se pudo leer la foto: ' + msgErr(err), 'error');
+  }
+  O.interpretando = false;
+  setFabEstado('idle');
+  pintarOverlay();
+}
+
+// Achica la imagen (lado máximo = max px) y devuelve un dataURL JPEG liviano.
+function imagenADataUrl(file, max) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      let w = img.width, h = img.height;
+      if (w > max || h > max) {
+        if (w >= h) { h = Math.round(h * max / w); w = max; }
+        else { w = Math.round(w * max / h); h = max; }
+      }
+      try {
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        c.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(c.toDataURL('image/jpeg', 0.8));
+      } catch (e) { reject(e); }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('no se pudo leer la imagen')); };
+    img.src = url;
+  });
+}
+
+// Construye una propuesta de Nutrición desde los ítems que ESTIMÓ la IA en la foto.
+// Porciones de foto = siempre estimación → nunca confianza 'alta' (se ajusta a mano).
+function propuestaDesdeFoto(itemsIA, slotHint, nota) {
+  const slots = cfgSlots();
+  let slot = null;
+  if (typeof slotHint === 'string' && slotHint.trim()) {
+    const sn = norm(slotHint);
+    slot = slots.find(s => norm(s.id) === sn || norm(s.label) === sn)
+        || slots.find(s => norm(s.label).includes(sn) || sn.includes(norm(s.id)));
+  }
+  if (!slot) slot = slots[0] || null;
+  const slotId = slot ? slot.id : 'almuerzo';
+
+  const items = [];
+  for (const it of (Array.isArray(itemsIA) ? itemsIA : [])) {
+    const nombre = (it && typeof it.nombre === 'string') ? it.nombre.trim() : '';
+    if (!nombre) continue;
+    const g = Number(it.gramos);
+    items.push(resolverItemNutricion(nombre, (Number.isFinite(g) && g > 0) ? g : null, null));
+  }
+  if (!items.length) {
+    items.push({ tipo: 'custom', id: null, nombre: 'Comida (foto)', cantidad: 1, prot: 0, carbo: 0, grasa: 0, kcal: 0 });
+  }
+  const hayReal = items.some(i => i.tipo !== 'custom');
+  const totalProt = items.reduce((s, it) => s + it.prot, 0);
+  const notaTxt = (typeof nota === 'string' && nota.trim()) ? nota.trim() : 'estimado por foto, ajustá las porciones';
+  return {
+    modulo: 'nutricion',
+    confianza: hayReal ? 'media' : 'baja',
+    campos: { slot: slotId, fecha: resolverFecha(''), items },
+    resumen: (slot ? slot.label : slotId) + ': '
+      + items.map(it => (it.cantLabel && it.cantLabel !== 1 ? it.cantLabel + (typeof it.cantLabel === 'number' ? '× ' : ' ') : '') + it.nombre).join(', ')
+      + ' · ' + Math.round(totalProt) + ' g prot · ' + notaTxt,
+    crudo: '📷 Foto del plato',
+  };
+}
+
 function pintarOverlay() {
   if (!O.overlay) return;
   if (!O.abierto) { O.overlay.innerHTML = ''; O.overlay.classList.remove('cap-abierto'); return; }
@@ -1114,6 +1234,8 @@ function vistaEntrada() {
     <textarea id="capTexto" class="cap-textarea" rows="3"
       placeholder="Ej: gasté 5 lucas en el súper · almorcé 250 de carne · tomé la creatina · press banca 4x10 con 80"
       aria-label="Texto a interpretar"${O.interpretando ? ' disabled' : ''}>${esc(O.texto)}</textarea>
+
+    <button class="cap-btn-sec cap-foto-btn" data-cap="foto"${O.interpretando ? ' disabled' : ''}>📷 Foto al plato → macros</button>
 
     <button class="cap-btn-primario${O.interpretando ? ' cap-pensando' : ''}" data-cap="entender"${O.interpretando ? ' disabled' : ''}>
       <span class="cap-btn-lbl">${O.interpretando ? 'Interpretando…' : 'Entender'}</span>
@@ -1721,6 +1843,7 @@ function onOverlayClick(e) {
   if (a === 'cerrar') { cerrar(); return; }
   if (a === 'grabar') { origenUltimo = 'voz'; toggleGrabar(); return; }
   if (a === 'entender') { entender(); return; }
+  if (a === 'foto') { elegirFoto(); return; }
   if (a === 'volver') { O.propuesta = null; pintarOverlay(); return; }
   if (a === 'guardar') { commit(); return; }
   if (a === 'quitar-item') { quitarItem(Number(el.dataset.i)); return; }
